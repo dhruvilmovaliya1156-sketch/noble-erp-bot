@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import re
 from datetime import datetime
 from typing import Dict, Optional
 from aiohttp import web
@@ -169,7 +170,8 @@ async def process_password(message: Message, state: FSMContext):
 
 async def perform_login(username: str, password: str, chat_id: int) -> Dict:
     """
-    Perform login using Playwright with robust success detection based on dashboard HTML.
+    Perform login using Playwright.
+    Waits for either the error message or navigation to dashboard.
     """
     page = None
     try:
@@ -189,112 +191,82 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
         await page.fill('input[name="txt_password"]', password)
         logger.info("Credentials filled")
 
-        # Click login – do NOT wait for navigation yet
+        # Click login
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # --- Success indicators based on dashboard HTML ---
-        success_selectors = [
-            # Primary: syllabus table (unique ID ends with 'grd_syllabus')
-            "table[id$='grd_syllabus']",
-            # Announcement table
-            "table[id$='grd_notif']",
-            # Logout link (inside user menu)
-            "a:has-text('Logout')",
-            # Dashboard heading
-            "h3.content-header-title:has-text('Dashboard')",
-            # Section titles
-            "h5:has-text('Syllabus Detail')",
-            "h5:has-text('Recent Announcement')",
-            # Presence of user name (from your profile)
-            "span#ctl00_lbl_name",
-            # Any element with class 'dashboard'
-            ".dashboard"
-        ]
-        
-        error_selectors = [
-            '.error',
-            '.alert',
-            'text=Invalid',
-            'text=Wrong',
-            'text=Failed',
-            'text=Incorrect'
-        ]
+        # Wait for either:
+        # 1. Error message (span#lbl_msg with specific text)
+        # 2. Navigation to dashboard URL (Home_student.aspx)
+        error_detected = False
+        error_text = ""
 
-        all_selectors = success_selectors + error_selectors
-
+        # First, wait a bit for possible error message
         try:
-            # Wait for any of these elements (max 60 seconds)
-            element = await page.wait_for_selector(
-                ', '.join(all_selectors),
+            error_element = await page.wait_for_selector(
+                "span#lbl_msg:has-text('User Name or Password Incorrect')",
                 state="visible",
-                timeout=60000
+                timeout=5000  # 5 seconds is enough for error to appear
             )
-            
-            # Determine if it's a success or error element
-            element_text = await element.text_content() or ""
-            
-            # Check if the found element matches any success selector
-            is_success = False
-            for sel in success_selectors:
-                if sel.startswith("table[id$=") or sel.startswith("span#"):
-                    # CSS selector that matches an ID – assume success if found
-                    try:
-                        if await page.locator(sel).count() > 0:
-                            is_success = True
-                            break
-                    except:
-                        pass
-                elif "has-text" in sel:
-                    # Extract expected text from :has-text('...')
-                    import re
-                    match = re.search(r"has-text\('([^']+)'\)", sel)
-                    if match:
-                        expected = match.group(1).lower()
-                        if expected in element_text.lower():
-                            is_success = True
-                            break
-                elif sel.startswith("text="):
-                    expected = sel[5:].strip().lower()
-                    if expected in element_text.lower():
-                        is_success = True
-                        break
-                else:
-                    # General CSS selector
-                    try:
-                        if await element.matches(sel):
-                            is_success = True
-                            break
-                    except:
-                        pass
-            
-            if is_success:
-                logger.info("Login successful - found dashboard element")
-                return {
-                    'success': True,
-                    'title': await page.title(),
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-            else:
-                error_text = element_text or "Login failed (unknown error)"
-                logger.info(f"Login failed - error: {error_text}")
-                return {
-                    'success': False,
-                    'error': error_text,
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
+            if error_element:
+                error_text = await error_element.text_content() or "User Name or Password Incorrect"
+                error_detected = True
+                logger.info(f"Login failed: {error_text}")
         except PlaywrightTimeoutError:
-            # No success or error indicator appeared within timeout
-            logger.warning("Timeout waiting for result indicators")
-            screenshot = await browser_manager.save_screenshot(page, "timeout")
-            # Also log current URL and title for debugging
-            current_url = page.url
-            current_title = await page.title()
-            logger.info(f"Current URL: {current_url}, Title: {current_title}")
+            pass
+
+        if error_detected:
             return {
                 'success': False,
-                'error': f"Login timeout - no response. URL: {current_url}, Title: {current_title}",
+                'error': error_text,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+        # No error yet, wait for navigation to dashboard
+        try:
+            # Wait up to 30 seconds for URL to contain Home_student.aspx
+            await page.wait_for_url("**/Home_student.aspx**", timeout=30000)
+            logger.info("Navigation to dashboard detected")
+            # Additional wait for stability (optional)
+            await page.wait_for_load_state("networkidle")
+            return {
+                'success': True,
+                'title': await page.title(),
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        except PlaywrightTimeoutError:
+            logger.warning("No navigation to dashboard within timeout")
+
+        # Fallback: wait for any dashboard element (if navigation already happened but URL didn't change)
+        success_selectors = [
+            "table[id$='grd_syllabus']",
+            "table[id$='grd_notif']",
+            "a:has-text('Logout')",
+            "h3.content-header-title:has-text('Dashboard')",
+            "h5:has-text('Syllabus Detail')",
+            "h5:has-text('Recent Announcement')",
+            "span#ctl00_lbl_name",
+            ".dashboard"
+        ]
+        try:
+            element = await page.wait_for_selector(
+                ', '.join(success_selectors),
+                state="visible",
+                timeout=30000
+            )
+            logger.info("Dashboard element found")
+            return {
+                'success': True,
+                'title': await page.title(),
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+        except PlaywrightTimeoutError:
+            # Still nothing – take screenshot and fail
+            logger.warning("No dashboard element found")
+            screenshot = await browser_manager.save_screenshot(page, "timeout")
+            return {
+                'success': False,
+                'error': f"Login timeout - no response. URL: {page.url}",
                 'screenshot': screenshot,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
