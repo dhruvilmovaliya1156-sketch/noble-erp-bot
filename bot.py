@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -88,7 +88,7 @@ class BrowserManager:
 # Global browser manager
 browser_manager = BrowserManager()
 
-# Simple health check server
+# Simple health check server (required for Render)
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -99,7 +99,16 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Health server on port {PORT}")
+    logger.info(f"Health server running on port {PORT}")
+
+# Inline keyboard after login
+def get_main_menu():
+    buttons = [
+        [InlineKeyboardButton(text="📊 Attendance", callback_data="attendance")],
+        [InlineKeyboardButton(text="🏠 Dashboard", callback_data="dashboard")],
+        [InlineKeyboardButton(text="🚪 Logout", callback_data="logout")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -130,35 +139,36 @@ async def process_password(message: Message, state: FSMContext):
 
     data = await state.get_data()
     username = data.get('username')
+    # Clear state immediately for security
     await state.clear()
 
     processing = await message.answer("🔄 Logging in...")
 
     try:
-        # Perform login and fetch attendance if successful
-        result = await perform_login_and_fetch(username, password, message.chat.id)
+        # Perform login
+        login_result = await perform_login(username, password, message.chat.id)
 
-        if result['success']:
-            # Send the attendance message (already sent inside the function)
-            # We just need to confirm completion
+        if login_result['success']:
+            # Store page and context info in user data (or keep in memory)
+            # We'll use a simple dict to store the page for this user
+            # For now, just show the menu
             await message.answer(
-                f"✅ Login Successful!\n"
-                f"Time: {result['timestamp']}\n"
-                f"Title: {result.get('title', 'N/A')}"
+                f"✅ Login Successful!\nTime: {login_result['timestamp']}",
+                reply_markup=get_main_menu()
             )
         else:
-            error_msg = result.get('error', 'Unknown error')
+            error_msg = login_result.get('error', 'Unknown error')
             await message.answer(f"❌ Login Failed!\nReason: {error_msg}")
 
             # Send screenshot if available
-            if result.get('screenshot'):
+            if login_result.get('screenshot'):
                 try:
-                    photo = FSInputFile(result['screenshot'])
+                    photo = FSInputFile(login_result['screenshot'])
                     await message.answer_photo(photo, caption="📸 Page after login attempt")
                 except Exception as e:
                     logger.error(f"Failed to send screenshot: {e}")
                     try:
-                        doc = FSInputFile(result['screenshot'])
+                        doc = FSInputFile(login_result['screenshot'])
                         await message.answer_document(doc, caption="📸 Screenshot (as file)")
                     except:
                         pass
@@ -169,83 +179,10 @@ async def process_password(message: Message, state: FSMContext):
     finally:
         await processing.delete()
 
-async def scrape_attendance(page: Page) -> str:
+async def perform_login(username: str, password: str, chat_id: int) -> Dict:
     """
-    Scrape attendance details from the attendance page.
-    Returns a formatted string to send to the user.
-    """
-    # Wait for student details to load
-    await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
-    
-    # Extract student info
-    student_info = await page.evaluate('''() => {
-        const getText = (id) => document.querySelector(id)?.innerText.trim() || 'N/A';
-        return {
-            name: getText("span[id$='lbl_name']"),
-            enroll: getText("span[id$='lbl_enroll']"),
-            college: getText("span[id$='lbl_coll']"),
-            dept: getText("span[id$='lbl_dept']"),
-            course: getText("span[id$='lbl_course']"),
-            sem: getText("span[id$='lbl_sm']"),
-            div: getText("span[id$='lbl_div']"),
-            batch: getText("span[id$='lbl_batch']"),
-            term: getText("span[id$='lbl_term']")
-        };
-    }''')
-    
-    # Wait for the month-wise table to be populated (Angular data)
-    # The table uses ng-repeat, we need to wait for at least one row to appear
-    try:
-        await page.wait_for_selector("tbody tr", timeout=15000)
-    except PlaywrightTimeoutError:
-        logger.warning("Month-wise attendance table did not load within timeout")
-    
-    # Extract month-wise attendance data
-    attendance_rows = await page.evaluate('''() => {
-        const rows = [];
-        document.querySelectorAll('tbody tr').forEach(tr => {
-            const cells = tr.querySelectorAll('td');
-            if (cells.length >= 8) {
-                rows.push({
-                    sr: cells[0]?.innerText.trim() || '',
-                    month: cells[1]?.innerText.trim() || '',
-                    arranged: cells[2]?.innerText.trim() || '',
-                    remaining: cells[3]?.innerText.trim() || '',
-                    total: cells[4]?.innerText.trim() || '',
-                    absent: cells[5]?.innerText.trim() || '',
-                    present: cells[6]?.innerText.trim() || '',
-                    percent: cells[7]?.innerText.trim() || ''
-                });
-            }
-        });
-        return rows;
-    }''')
-    
-    # Format the message
-    msg = f"📋 *Attendance Details*\n\n"
-    msg += f"*Name*: {student_info['name']}\n"
-    msg += f"*Enrollment*: {student_info['enroll']}\n"
-    msg += f"*Course*: {student_info['course']} - Semester {student_info['sem']}\n"
-    msg += f"*Division*: {student_info['div']}  *Batch*: {student_info['batch']}\n"
-    msg += f"*Term*: {student_info['term']}\n\n"
-    
-    if attendance_rows:
-        msg += "*Month-wise Attendance*\n"
-        msg += "```\n"
-        msg += f"{'Month':<12} {'Arr':>4} {'Rem':>4} {'Total':>5} {'Abs':>4} {'Pres':>4} {'%':>5}\n"
-        msg += "-" * 45 + "\n"
-        for row in attendance_rows:
-            msg += f"{row['month']:<12} {row['arranged']:>4} {row['remaining']:>4} {row['total']:>5} {row['absent']:>4} {row['present']:>4} {row['percent']:>5}\n"
-        msg += "```\n"
-    else:
-        msg += "No month-wise attendance data available.\n"
-    
-    return msg
-
-async def perform_login_and_fetch(username: str, password: str, chat_id: int) -> Dict:
-    """
-    Perform login, close announcement popup, fetch attendance, and send result.
-    Returns a dict indicating success/failure (same as before).
+    Perform login and return result.
+    If successful, stores the page in a global dict for later use.
     """
     page = None
     try:
@@ -267,7 +204,7 @@ async def perform_login_and_fetch(username: str, password: str, chat_id: int) ->
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # --- Check for error message (quick) ---
+        # Check for error message (quick)
         try:
             error_element = await page.wait_for_selector(
                 "span#lbl_msg:has-text('User Name or Password Incorrect')",
@@ -284,14 +221,13 @@ async def perform_login_and_fetch(username: str, password: str, chat_id: int) ->
         except PlaywrightTimeoutError:
             pass  # No error message
 
-        # --- Wait for navigation to dashboard URL ---
+        # Wait for navigation to dashboard URL
         try:
             await page.wait_for_url("**/Home_student.aspx**", timeout=30000)
             await page.wait_for_load_state("networkidle")
             logger.info("Navigation to dashboard detected")
         except PlaywrightTimeoutError:
-            logger.warning("No navigation to dashboard within timeout")
-            # Check for dashboard elements as fallback
+            # Fallback: check for dashboard elements
             dashboard_selectors = [
                 "table[id$='grd_syllabus']",
                 "table[id$='grd_notif']",
@@ -316,9 +252,8 @@ async def perform_login_and_fetch(username: str, password: str, chat_id: int) ->
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
 
-        # --- Close announcement popup ---
+        # Close announcement popup if present
         try:
-            # Wait for popup close button (visible)
             close_button = await page.wait_for_selector(
                 "span[onclick='hide_popup();']",
                 state="visible",
@@ -326,22 +261,14 @@ async def perform_login_and_fetch(username: str, password: str, chat_id: int) ->
             )
             await close_button.click()
             logger.info("Announcement popup closed")
-            # Brief wait for popup to disappear
             await page.wait_for_timeout(1000)
         except PlaywrightTimeoutError:
-            logger.info("No announcement popup found or already closed")
+            logger.info("No announcement popup found")
 
-        # --- Navigate to attendance page ---
-        logger.info("Navigating to attendance page")
-        await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
-        
-        # --- Scrape attendance ---
-        attendance_msg = await scrape_attendance(page)
-        
-        # Send the attendance message to the user
-        await bot.send_message(chat_id, attendance_msg, parse_mode="Markdown")
-        
-        # Return success
+        # Store the page in a global dict for this user (chat_id)
+        # We'll use a simple dict; in production consider using a more robust storage
+        user_pages[chat_id] = page
+        # Return success, but don't close the page yet
         return {
             'success': True,
             'title': await page.title(),
@@ -355,9 +282,121 @@ async def perform_login_and_fetch(username: str, password: str, chat_id: int) ->
             'error': f"Automation error: {str(e)[:100]}",
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-    finally:
+    # Note: we do NOT close the page here because we need it for subsequent actions
+
+# Global dict to store pages per user (chat_id)
+user_pages = {}
+
+async def close_user_page(chat_id: int):
+    """Close and remove the page for a user"""
+    page = user_pages.pop(chat_id, None)
+    if page:
+        await page.close()
+        logger.info(f"Closed page for user {chat_id}")
+
+async def scrape_attendance(page: Page) -> str:
+    """Scrape attendance details from the attendance page."""
+    # Navigate to attendance page
+    await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
+    
+    # Wait for student details to load
+    await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
+    
+    # Extract student info
+    student_info = await page.evaluate('''() => {
+        const getText = (id) => document.querySelector(id)?.innerText.trim() || 'N/A';
+        return {
+            name: getText("span[id$='lbl_name']"),
+            enroll: getText("span[id$='lbl_enroll']"),
+            college: getText("span[id$='lbl_coll']"),
+            dept: getText("span[id$='lbl_dept']"),
+            course: getText("span[id$='lbl_course']"),
+            sem: getText("span[id$='lbl_sm']"),
+            div: getText("span[id$='lbl_div']"),
+            batch: getText("span[id$='lbl_batch']"),
+            term: getText("span[id$='lbl_term']")
+        };
+    }''')
+    
+    # Wait for month-wise table (Angular)
+    try:
+        await page.wait_for_selector("tbody tr", timeout=15000)
+    except PlaywrightTimeoutError:
+        logger.warning("Month-wise attendance table did not load")
+    
+    # Extract table rows
+    attendance_rows = await page.evaluate('''() => {
+        const rows = [];
+        document.querySelectorAll('tbody tr').forEach(tr => {
+            const cells = tr.querySelectorAll('td');
+            if (cells.length >= 8) {
+                rows.push({
+                    sr: cells[0]?.innerText.trim() || '',
+                    month: cells[1]?.innerText.trim() || '',
+                    arranged: cells[2]?.innerText.trim() || '',
+                    remaining: cells[3]?.innerText.trim() || '',
+                    total: cells[4]?.innerText.trim() || '',
+                    absent: cells[5]?.innerText.trim() || '',
+                    present: cells[6]?.innerText.trim() || '',
+                    percent: cells[7]?.innerText.trim() || ''
+                });
+            }
+        });
+        return rows;
+    }''')
+    
+    # Format message
+    msg = f"📋 *Attendance Details*\n\n"
+    msg += f"*Name*: {student_info['name']}\n"
+    msg += f"*Enrollment*: {student_info['enroll']}\n"
+    msg += f"*Course*: {student_info['course']} - Semester {student_info['sem']}\n"
+    msg += f"*Division*: {student_info['div']}  *Batch*: {student_info['batch']}\n"
+    msg += f"*Term*: {student_info['term']}\n\n"
+    
+    if attendance_rows:
+        msg += "*Month-wise Attendance*\n"
+        msg += "```\n"
+        msg += f"{'Month':<12} {'Arr':>4} {'Rem':>4} {'Total':>5} {'Abs':>4} {'Pres':>4} {'%':>5}\n"
+        msg += "-" * 45 + "\n"
+        for row in attendance_rows:
+            msg += f"{row['month']:<12} {row['arranged']:>4} {row['remaining']:>4} {row['total']:>5} {row['absent']:>4} {row['present']:>4} {row['percent']:>5}\n"
+        msg += "```\n"
+    else:
+        msg += "No month-wise attendance data available.\n"
+    
+    return msg
+
+@dp.callback_query()
+async def handle_menu_callback(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    data = callback.data
+
+    if data == "attendance":
+        await callback.answer("Fetching attendance...")
+        page = user_pages.get(chat_id)
+        if not page:
+            await callback.message.answer("❌ You are not logged in. Please use /start to login.")
+            return
+        try:
+            attendance_msg = await scrape_attendance(page)
+            await callback.message.answer(attendance_msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Attendance error: {e}")
+            await callback.message.answer("❌ Failed to fetch attendance.")
+        await callback.message.edit_reply_markup(reply_markup=get_main_menu())  # keep menu
+
+    elif data == "dashboard":
+        await callback.answer("Returning to dashboard...")
+        page = user_pages.get(chat_id)
         if page:
-            await page.close()
+            await page.goto("https://noble.icrp.in/academic/Student-cp/Home_student.aspx", wait_until="networkidle")
+        await callback.message.answer("🏠 You are back at the dashboard.", reply_markup=get_main_menu())
+
+    elif data == "logout":
+        await callback.answer("Logging out...")
+        await close_user_page(chat_id)
+        await callback.message.answer("🔓 You have been logged out. Use /start to login again.")
+        await callback.message.edit_reply_markup(reply_markup=None)
 
 async def on_startup():
     """Initialize browser and health server on startup"""
@@ -366,6 +405,9 @@ async def on_startup():
 
 async def on_shutdown():
     """Cleanup browser on shutdown"""
+    # Close all user pages
+    for chat_id in list(user_pages.keys()):
+        await close_user_page(chat_id)
     await browser_manager.stop()
 
 async def main():
