@@ -298,19 +298,33 @@ async def close_user_page(chat_id: int):
         await page.close()
         logger.info(f"Closed page for user {chat_id}")
 
+async def verify_logged_in(page: Page) -> bool:
+    """Check if we are still on a logged-in page"""
+    try:
+        # Look for a logout link or user name
+        logout_link = await page.query_selector("a:has-text('Logout')")
+        user_name = await page.query_selector("span#ctl00_lbl_name")
+        return bool(logout_link or user_name)
+    except:
+        return False
+
 async def scrape_attendance(page: Page, chat_id: int) -> str:
     """
     Scrape attendance details from the attendance page.
     Raises an exception with screenshot if any step fails.
     """
     try:
+        # First, verify we're still logged in
+        if not await verify_logged_in(page):
+            raise Exception("Session expired or not logged in")
+
         # Navigate to attendance page
         logger.info("Navigating to attendance page")
         await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
-        await page.wait_for_timeout(2000)  # brief wait for Angular
+        await page.wait_for_timeout(3000)  # extra wait for Angular
 
         # Wait for student details to load
-        await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
+        await page.wait_for_selector("span[id$='lbl_name']", timeout=15000)
         
         # Extract student info
         student_info = await page.evaluate('''() => {
@@ -332,19 +346,9 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         }''')
         
         # Wait for month-wise table (Angular)
+        attendance_rows = []
         try:
-            await page.wait_for_selector("tbody tr", timeout=15000)
-        except PlaywrightTimeoutError:
-            # Maybe there is no data; try to find a "No records" message
-            no_data = await page.query_selector("text='Record Not Available..'")
-            if no_data:
-                logger.info("No attendance data available")
-                attendance_rows = []
-            else:
-                # If no rows and no message, take screenshot and raise
-                screenshot = await browser_manager.save_screenshot(page, "attendance_no_table")
-                raise Exception(f"Attendance table not found. Screenshot saved.")
-        else:
+            await page.wait_for_selector("tbody tr", timeout=20000)
             # Extract table rows
             attendance_rows = await page.evaluate('''() => {
                 const rows = [];
@@ -364,8 +368,18 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
                 });
                 return rows;
             }''')
+            logger.info(f"Found {len(attendance_rows)} attendance rows")
+        except PlaywrightTimeoutError:
+            # Maybe there is no data; try to find a "No records" message
+            no_data = await page.query_selector("text='Record Not Available..'")
+            if no_data:
+                logger.info("No attendance data available")
+            else:
+                # If no rows and no message, take screenshot and raise
+                screenshot = await browser_manager.save_screenshot(page, "attendance_no_table")
+                raise Exception(f"Attendance table not found. Screenshot: {screenshot}")
         
-        # Format message (plain text to avoid Markdown issues)
+        # Format message (plain text)
         msg = f"📋 Attendance Details\n\n"
         msg += f"Name: {student_info['name']}\n"
         msg += f"Enrollment: {student_info['enroll']}\n"
@@ -375,7 +389,6 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         
         if attendance_rows:
             msg += "Month-wise Attendance\n"
-            # Use a simple table format
             header = f"{'Month':<12} {'Arr':>4} {'Rem':>4} {'Total':>5} {'Abs':>4} {'Pres':>4} {'%':>5}"
             msg += header + "\n"
             msg += "-" * len(header) + "\n"
