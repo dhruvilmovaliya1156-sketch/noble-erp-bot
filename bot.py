@@ -135,9 +135,12 @@ async def process_password(message: Message, state: FSMContext):
     processing = await message.answer("🔄 Logging in...")
 
     try:
-        result = await perform_login(username, password, message.chat.id)
+        # Perform login and fetch attendance if successful
+        result = await perform_login_and_fetch(username, password, message.chat.id)
 
         if result['success']:
+            # Send the attendance message (already sent inside the function)
+            # We just need to confirm completion
             await message.answer(
                 f"✅ Login Successful!\n"
                 f"Time: {result['timestamp']}\n"
@@ -154,7 +157,6 @@ async def process_password(message: Message, state: FSMContext):
                     await message.answer_photo(photo, caption="📸 Page after login attempt")
                 except Exception as e:
                     logger.error(f"Failed to send screenshot: {e}")
-                    # Fallback: send as document
                     try:
                         doc = FSInputFile(result['screenshot'])
                         await message.answer_document(doc, caption="📸 Screenshot (as file)")
@@ -167,10 +169,83 @@ async def process_password(message: Message, state: FSMContext):
     finally:
         await processing.delete()
 
-async def perform_login(username: str, password: str, chat_id: int) -> Dict:
+async def scrape_attendance(page: Page) -> str:
     """
-    Perform login using Playwright.
-    Detects error message or dashboard via URL or element presence.
+    Scrape attendance details from the attendance page.
+    Returns a formatted string to send to the user.
+    """
+    # Wait for student details to load
+    await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
+    
+    # Extract student info
+    student_info = await page.evaluate('''() => {
+        const getText = (id) => document.querySelector(id)?.innerText.trim() || 'N/A';
+        return {
+            name: getText("span[id$='lbl_name']"),
+            enroll: getText("span[id$='lbl_enroll']"),
+            college: getText("span[id$='lbl_coll']"),
+            dept: getText("span[id$='lbl_dept']"),
+            course: getText("span[id$='lbl_course']"),
+            sem: getText("span[id$='lbl_sm']"),
+            div: getText("span[id$='lbl_div']"),
+            batch: getText("span[id$='lbl_batch']"),
+            term: getText("span[id$='lbl_term']")
+        };
+    }''')
+    
+    # Wait for the month-wise table to be populated (Angular data)
+    # The table uses ng-repeat, we need to wait for at least one row to appear
+    try:
+        await page.wait_for_selector("tbody tr", timeout=15000)
+    except PlaywrightTimeoutError:
+        logger.warning("Month-wise attendance table did not load within timeout")
+    
+    # Extract month-wise attendance data
+    attendance_rows = await page.evaluate('''() => {
+        const rows = [];
+        document.querySelectorAll('tbody tr').forEach(tr => {
+            const cells = tr.querySelectorAll('td');
+            if (cells.length >= 8) {
+                rows.push({
+                    sr: cells[0]?.innerText.trim() || '',
+                    month: cells[1]?.innerText.trim() || '',
+                    arranged: cells[2]?.innerText.trim() || '',
+                    remaining: cells[3]?.innerText.trim() || '',
+                    total: cells[4]?.innerText.trim() || '',
+                    absent: cells[5]?.innerText.trim() || '',
+                    present: cells[6]?.innerText.trim() || '',
+                    percent: cells[7]?.innerText.trim() || ''
+                });
+            }
+        });
+        return rows;
+    }''')
+    
+    # Format the message
+    msg = f"📋 *Attendance Details*\n\n"
+    msg += f"*Name*: {student_info['name']}\n"
+    msg += f"*Enrollment*: {student_info['enroll']}\n"
+    msg += f"*Course*: {student_info['course']} - Semester {student_info['sem']}\n"
+    msg += f"*Division*: {student_info['div']}  *Batch*: {student_info['batch']}\n"
+    msg += f"*Term*: {student_info['term']}\n\n"
+    
+    if attendance_rows:
+        msg += "*Month-wise Attendance*\n"
+        msg += "```\n"
+        msg += f"{'Month':<12} {'Arr':>4} {'Rem':>4} {'Total':>5} {'Abs':>4} {'Pres':>4} {'%':>5}\n"
+        msg += "-" * 45 + "\n"
+        for row in attendance_rows:
+            msg += f"{row['month']:<12} {row['arranged']:>4} {row['remaining']:>4} {row['total']:>5} {row['absent']:>4} {row['present']:>4} {row['percent']:>5}\n"
+        msg += "```\n"
+    else:
+        msg += "No month-wise attendance data available.\n"
+    
+    return msg
+
+async def perform_login_and_fetch(username: str, password: str, chat_id: int) -> Dict:
+    """
+    Perform login, close announcement popup, fetch attendance, and send result.
+    Returns a dict indicating success/failure (same as before).
     """
     page = None
     try:
@@ -214,49 +289,62 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
             await page.wait_for_url("**/Home_student.aspx**", timeout=30000)
             await page.wait_for_load_state("networkidle")
             logger.info("Navigation to dashboard detected")
-            return {
-                'success': True,
-                'title': await page.title(),
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
         except PlaywrightTimeoutError:
             logger.warning("No navigation to dashboard within timeout")
+            # Check for dashboard elements as fallback
+            dashboard_selectors = [
+                "table[id$='grd_syllabus']",
+                "table[id$='grd_notif']",
+                "a:has-text('Logout')",
+                "h3.content-header-title:has-text('Dashboard')",
+                "span#ctl00_lbl_name",
+                ".dashboard"
+            ]
+            found = await page.evaluate('''(selectors) => {
+                for (const sel of selectors) {
+                    if (document.querySelector(sel)) return true;
+                }
+                return false;
+            }''', dashboard_selectors)
+            if not found:
+                logger.warning("No dashboard element or error found")
+                screenshot = await browser_manager.save_screenshot(page, "timeout")
+                return {
+                    'success': False,
+                    'error': f"Login timeout - no response. URL: {page.url}",
+                    'screenshot': screenshot,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
 
-        # --- If URL didn't change, check for dashboard elements ---
-        dashboard_selectors = [
-            "table[id$='grd_syllabus']",
-            "table[id$='grd_notif']",
-            "a:has-text('Logout')",
-            "h3.content-header-title:has-text('Dashboard')",
-            "h5:has-text('Syllabus Detail')",
-            "h5:has-text('Recent Announcement')",
-            "span#ctl00_lbl_name",
-            ".dashboard"
-        ]
+        # --- Close announcement popup ---
+        try:
+            # Wait for popup close button (visible)
+            close_button = await page.wait_for_selector(
+                "span[onclick='hide_popup();']",
+                state="visible",
+                timeout=5000
+            )
+            await close_button.click()
+            logger.info("Announcement popup closed")
+            # Brief wait for popup to disappear
+            await page.wait_for_timeout(1000)
+        except PlaywrightTimeoutError:
+            logger.info("No announcement popup found or already closed")
 
-        # Evaluate in page context to see if any selector exists
-        found = await page.evaluate('''(selectors) => {
-            for (const sel of selectors) {
-                if (document.querySelector(sel)) return true;
-            }
-            return false;
-        }''', dashboard_selectors)
-
-        if found:
-            logger.info("Dashboard element found")
-            return {
-                'success': True,
-                'title': await page.title(),
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-
-        # Nothing found – take screenshot and fail
-        logger.warning("No dashboard element or error found")
-        screenshot = await browser_manager.save_screenshot(page, "timeout")
+        # --- Navigate to attendance page ---
+        logger.info("Navigating to attendance page")
+        await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
+        
+        # --- Scrape attendance ---
+        attendance_msg = await scrape_attendance(page)
+        
+        # Send the attendance message to the user
+        await bot.send_message(chat_id, attendance_msg, parse_mode="Markdown")
+        
+        # Return success
         return {
-            'success': False,
-            'error': f"Login timeout - no response. URL: {page.url}",
-            'screenshot': screenshot,
+            'success': True,
+            'title': await page.title(),
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
