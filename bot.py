@@ -301,7 +301,6 @@ async def close_user_page(chat_id: int):
 async def verify_logged_in(page: Page) -> bool:
     """Check if we are still on a logged-in page"""
     try:
-        # Look for a logout link or user name
         logout_link = await page.query_selector("a:has-text('Logout')")
         user_name = await page.query_selector("span#ctl00_lbl_name")
         return bool(logout_link or user_name)
@@ -311,6 +310,7 @@ async def verify_logged_in(page: Page) -> bool:
 async def scrape_attendance(page: Page, chat_id: int) -> str:
     """
     Scrape attendance details from the attendance page.
+    Waits for actual data rows using a custom JavaScript condition.
     Raises an exception with screenshot if any step fails.
     """
     try:
@@ -321,7 +321,7 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         # Navigate to attendance page
         logger.info("Navigating to attendance page")
         await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
-        await page.wait_for_timeout(3000)  # extra wait for Angular
+        await page.wait_for_timeout(3000)  # brief wait for Angular
 
         # Wait for student details to load
         await page.wait_for_selector("span[id$='lbl_name']", timeout=15000)
@@ -345,10 +345,34 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
             };
         }''')
         
-        # Wait for month-wise table (Angular)
-        attendance_rows = []
+        # Wait for attendance table data to load
+        # We wait until at least one row has a non-empty month cell
         try:
-            await page.wait_for_selector("tbody tr", timeout=20000)
+            await page.wait_for_function('''
+                () => {
+                    const rows = document.querySelectorAll('tbody tr');
+                    if (rows.length === 0) return false;
+                    for (let row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length >= 2 && cells[1].innerText.trim() !== '') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            ''', timeout=20000)
+            logger.info("Attendance data rows detected")
+        except PlaywrightTimeoutError:
+            # Maybe there is no data; try to find a "No records" message
+            no_data = await page.query_selector("text='Record Not Available..'")
+            if no_data:
+                logger.info("No attendance data available")
+                attendance_rows = []
+            else:
+                # If no rows and no message, take screenshot and raise
+                screenshot = await browser_manager.save_screenshot(page, "attendance_no_table")
+                raise Exception(f"Attendance table not found. Screenshot: {screenshot}")
+        else:
             # Extract table rows
             attendance_rows = await page.evaluate('''() => {
                 const rows = [];
@@ -369,15 +393,6 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
                 return rows;
             }''')
             logger.info(f"Found {len(attendance_rows)} attendance rows")
-        except PlaywrightTimeoutError:
-            # Maybe there is no data; try to find a "No records" message
-            no_data = await page.query_selector("text='Record Not Available..'")
-            if no_data:
-                logger.info("No attendance data available")
-            else:
-                # If no rows and no message, take screenshot and raise
-                screenshot = await browser_manager.save_screenshot(page, "attendance_no_table")
-                raise Exception(f"Attendance table not found. Screenshot: {screenshot}")
         
         # Format message (plain text)
         msg = f"📋 Attendance Details\n\n"
