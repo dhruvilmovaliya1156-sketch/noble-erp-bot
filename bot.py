@@ -10,7 +10,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, FSInputFile
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, Page, TimeoutError as PlaywrightTimeoutError
 
@@ -78,7 +78,7 @@ class BrowserManager:
         return await self.context.new_page()
     
     async def save_screenshot(self, page: Page, prefix: str = "debug") -> str:
-        """Save a screenshot for debugging"""
+        """Save a screenshot and return the file path"""
         self.screenshot_counter += 1
         filename = f"/tmp/{prefix}_{self.screenshot_counter}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         await page.screenshot(path=filename)
@@ -145,7 +145,7 @@ async def process_password(message: Message, state: FSMContext):
     
     try:
         # Perform login
-        result = await perform_login(username, password)
+        result = await perform_login(username, password, message.chat.id)
         
         # Send result
         if result['success']:
@@ -157,6 +157,14 @@ async def process_password(message: Message, state: FSMContext):
         else:
             error_msg = result.get('error', 'Unknown error')
             await message.answer(f"❌ Login Failed!\n\nReason: {error_msg}")
+            
+            # If a screenshot was saved, send it
+            if result.get('screenshot'):
+                try:
+                    photo = FSInputFile(result['screenshot'])
+                    await message.answer_photo(photo, caption="📸 Screenshot at timeout")
+                except Exception as e:
+                    logger.error(f"Failed to send screenshot: {e}")
     
     except Exception as e:
         logger.error(f"Login error: {str(e)}")
@@ -166,9 +174,9 @@ async def process_password(message: Message, state: FSMContext):
         # Delete processing message
         await processing_msg.delete()
 
-async def perform_login(username: str, password: str) -> Dict:
+async def perform_login(username: str, password: str, chat_id: int) -> Dict:
     """
-    Perform login using Playwright with improved element-based waiting.
+    Perform login using Playwright with screenshot on timeout.
     """
     page = None
     try:
@@ -193,7 +201,6 @@ async def perform_login(username: str, password: str) -> Dict:
         logger.info("Login button clicked")
 
         # Wait for either success indicators OR error indicators (up to 45 seconds)
-        # Based on your after-login image, look for dashboard-specific elements
         success_selectors = [
             "text=Faculty of Computer Application",
             "text=Dashboard",
@@ -202,9 +209,9 @@ async def perform_login(username: str, password: str) -> Dict:
             "text=Syllabus Detail",
             "text=Recent Announcement",
             'a[href="logout.php"]',
-            "text=BCA1401",  # subject from your image
+            "text=BCA1401",
             "text=Windows Application Development using C#.Net",
-            "text=MYSY 2025-26"  # announcement
+            "text=MYSY 2025-26"
         ]
         
         error_selectors = [
@@ -216,7 +223,6 @@ async def perform_login(username: str, password: str) -> Dict:
             'text=Incorrect'
         ]
 
-        # Combine selectors for waiting (wait for any of these to appear)
         all_selectors = success_selectors + error_selectors
         try:
             # Wait for any of the selectors to appear (max 45 seconds)
@@ -228,7 +234,6 @@ async def perform_login(username: str, password: str) -> Dict:
             
             # Determine if it's a success or error element
             element_text = await element.text_content() or ""
-            element_tag = await page.evaluate('(el) => el.tagName', element)
             
             # Check if the found element matches any success selector
             is_success = False
@@ -239,7 +244,6 @@ async def perform_login(username: str, password: str) -> Dict:
                         is_success = True
                         break
                 else:
-                    # Check if element matches the CSS selector
                     try:
                         if await element.matches(sel):
                             is_success = True
@@ -256,7 +260,6 @@ async def perform_login(username: str, password: str) -> Dict:
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             else:
-                # Error element found
                 error_text = element_text or "Login failed (unknown error)"
                 logger.info(f"Login failed - error: {error_text}")
                 return {
@@ -268,11 +271,11 @@ async def perform_login(username: str, password: str) -> Dict:
         except PlaywrightTimeoutError:
             # No success or error indicator appeared within timeout
             logger.warning("Timeout waiting for login result indicators")
-            # Save screenshot for debugging
             screenshot_path = await browser_manager.save_screenshot(page, "timeout")
             return {
                 'success': False,
-                'error': f"Login timeout - no response from server (screenshot saved: {screenshot_path})",
+                'error': "Login timeout - no response from server. Screenshot attached.",
+                'screenshot': screenshot_path,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
