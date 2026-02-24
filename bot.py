@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import re
 from datetime import datetime
 from typing import Dict, Optional
 from aiohttp import web
@@ -171,18 +170,16 @@ async def process_password(message: Message, state: FSMContext):
 async def perform_login(username: str, password: str, chat_id: int) -> Dict:
     """
     Perform login using Playwright.
-    Waits for either the error message or navigation to dashboard.
+    Detects error message or dashboard via URL or element presence.
     """
     page = None
     try:
         page = await browser_manager.new_page()
-        page.set_default_timeout(60000)  # 60 seconds
+        page.set_default_timeout(60000)
 
         # Navigate to login page
         logger.info("Navigating to login page")
         await page.goto("https://noble.icrp.in/academic/", wait_until="networkidle")
-        
-        # Wait for username field
         await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=10000)
         logger.info("Login page loaded")
 
@@ -195,40 +192,28 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # Wait for either:
-        # 1. Error message (span#lbl_msg with specific text)
-        # 2. Navigation to dashboard URL (Home_student.aspx)
-        error_detected = False
-        error_text = ""
-
-        # First, wait a bit for possible error message
+        # --- Check for error message (quick) ---
         try:
             error_element = await page.wait_for_selector(
                 "span#lbl_msg:has-text('User Name or Password Incorrect')",
                 state="visible",
-                timeout=5000  # 5 seconds is enough for error to appear
+                timeout=5000
             )
-            if error_element:
-                error_text = await error_element.text_content() or "User Name or Password Incorrect"
-                error_detected = True
-                logger.info(f"Login failed: {error_text}")
-        except PlaywrightTimeoutError:
-            pass
-
-        if error_detected:
+            error_text = await error_element.text_content()
+            logger.info("Login failed - error message found")
             return {
                 'success': False,
-                'error': error_text,
+                'error': error_text or "User Name or Password Incorrect",
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
+        except PlaywrightTimeoutError:
+            pass  # No error message
 
-        # No error yet, wait for navigation to dashboard
+        # --- Wait for navigation to dashboard URL ---
         try:
-            # Wait up to 30 seconds for URL to contain Home_student.aspx
             await page.wait_for_url("**/Home_student.aspx**", timeout=30000)
-            logger.info("Navigation to dashboard detected")
-            # Additional wait for stability (optional)
             await page.wait_for_load_state("networkidle")
+            logger.info("Navigation to dashboard detected")
             return {
                 'success': True,
                 'title': await page.title(),
@@ -237,8 +222,8 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
         except PlaywrightTimeoutError:
             logger.warning("No navigation to dashboard within timeout")
 
-        # Fallback: wait for any dashboard element (if navigation already happened but URL didn't change)
-        success_selectors = [
+        # --- If URL didn't change, check for dashboard elements ---
+        dashboard_selectors = [
             "table[id$='grd_syllabus']",
             "table[id$='grd_notif']",
             "a:has-text('Logout')",
@@ -248,28 +233,32 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
             "span#ctl00_lbl_name",
             ".dashboard"
         ]
-        try:
-            element = await page.wait_for_selector(
-                ', '.join(success_selectors),
-                state="visible",
-                timeout=30000
-            )
+
+        # Evaluate in page context to see if any selector exists
+        found = await page.evaluate('''(selectors) => {
+            for (const sel of selectors) {
+                if (document.querySelector(sel)) return true;
+            }
+            return false;
+        }''', dashboard_selectors)
+
+        if found:
             logger.info("Dashboard element found")
             return {
                 'success': True,
                 'title': await page.title(),
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
-        except PlaywrightTimeoutError:
-            # Still nothing – take screenshot and fail
-            logger.warning("No dashboard element found")
-            screenshot = await browser_manager.save_screenshot(page, "timeout")
-            return {
-                'success': False,
-                'error': f"Login timeout - no response. URL: {page.url}",
-                'screenshot': screenshot,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+
+        # Nothing found – take screenshot and fail
+        logger.warning("No dashboard element or error found")
+        screenshot = await browser_manager.save_screenshot(page, "timeout")
+        return {
+            'success': False,
+            'error': f"Login timeout - no response. URL: {page.url}",
+            'screenshot': screenshot,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
 
     except Exception as e:
         logger.error(f"Automation error: {e}")
