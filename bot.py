@@ -194,9 +194,9 @@ async def perform_login(username: str, password: str) -> Dict:
             success_indicators = [
                 'a[href="logout.php"]',
                 '.dashboard',
-                'text/Logout',
-                'text/Welcome',
-                'text/Dashboard'
+                'text=Logout',
+                'text=Welcome',
+                'text=Dashboard'
             ]
             
             login_successful = False
@@ -224,9 +224,9 @@ async def perform_login(username: str, password: str) -> Dict:
                 error_elements = [
                     '.error',
                     '.alert',
-                    'text/Invalid',
-                    'text/Wrong',
-                    'text/Failed'
+                    'text=Invalid',
+                    'text=Wrong',
+                    'text=Failed'
                 ]
                 
                 error_message = "Invalid credentials or login failed"
