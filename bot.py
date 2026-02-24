@@ -42,13 +42,16 @@ class LoginStates(StatesGroup):
     waiting_for_password = State()
 
 class BrowserManager:
+    """Manages Playwright browser instances"""
+    
     def __init__(self):
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context = None
         self.screenshot_counter = 0
-
+    
     async def start(self):
+        """Start browser instance"""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=True,
@@ -59,8 +62,9 @@ class BrowserManager:
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
         logger.info("Browser started")
-
+    
     async def stop(self):
+        """Stop browser instance"""
         if self.context:
             await self.context.close()
         if self.browser:
@@ -68,20 +72,23 @@ class BrowserManager:
         if self.playwright:
             await self.playwright.stop()
         logger.info("Browser stopped")
-
+    
     async def new_page(self) -> Page:
+        """Create a new page"""
         return await self.context.new_page()
-
+    
     async def save_screenshot(self, page: Page, prefix: str = "debug") -> str:
+        """Save a screenshot and return the file path"""
         self.screenshot_counter += 1
         filename = f"/tmp/{prefix}_{self.screenshot_counter}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         await page.screenshot(path=filename)
         logger.info(f"Screenshot saved to {filename}")
         return filename
 
+# Global browser manager
 browser_manager = BrowserManager()
 
-# Health check server
+# Simple health check server
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -96,6 +103,7 @@ async def start_health_server():
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    """Handle /start command"""
     await message.answer(
         "🔐 Welcome!\n\nEnter your username:"
     )
@@ -103,6 +111,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.message(LoginStates.waiting_for_username)
 async def process_username(message: Message, state: FSMContext):
+    """Process username input"""
     username = message.text.strip()
     if not username:
         await message.answer("Username cannot be empty. Try again:")
@@ -113,6 +122,7 @@ async def process_username(message: Message, state: FSMContext):
 
 @dp.message(LoginStates.waiting_for_password)
 async def process_password(message: Message, state: FSMContext):
+    """Process password input and perform login"""
     password = message.text.strip()
     if not password:
         await message.answer("Password cannot be empty. Try again:")
@@ -158,82 +168,124 @@ async def process_password(message: Message, state: FSMContext):
         await processing.delete()
 
 async def perform_login(username: str, password: str, chat_id: int) -> Dict:
+    """
+    Perform login using Playwright with robust success detection based on dashboard HTML.
+    """
     page = None
     try:
         page = await browser_manager.new_page()
-        page.set_default_timeout(60000)
+        page.set_default_timeout(60000)  # 60 seconds
 
+        # Navigate to login page
         logger.info("Navigating to login page")
         await page.goto("https://noble.icrp.in/academic/", wait_until="networkidle")
-        await page.wait_for_selector('input[name="txt_uname"]', timeout=10000)
+        
+        # Wait for username field
+        await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=10000)
         logger.info("Login page loaded")
 
+        # Fill credentials
         await page.fill('input[name="txt_uname"]', username)
         await page.fill('input[name="txt_password"]', password)
         logger.info("Credentials filled")
 
+        # Click login – do NOT wait for navigation yet
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # Wait for any known element (dashboard or error)
+        # --- Success indicators based on dashboard HTML ---
         success_selectors = [
-            "text=Faculty of Computer Application",
-            "text=Dashboard",
-            "text=Attendance Details",
-            "text=Syllabus Detail",
-            "text=Recent Announcement",
-            "text=BCA1401",
-            'a[href="logout.php"]'
+            # Primary: syllabus table (unique ID ends with 'grd_syllabus')
+            "table[id$='grd_syllabus']",
+            # Announcement table
+            "table[id$='grd_notif']",
+            # Logout link (inside user menu)
+            "a:has-text('Logout')",
+            # Dashboard heading
+            "h3.content-header-title:has-text('Dashboard')",
+            # Section titles
+            "h5:has-text('Syllabus Detail')",
+            "h5:has-text('Recent Announcement')",
+            # Presence of user name (from your profile)
+            "span#ctl00_lbl_name",
+            # Any element with class 'dashboard'
+            ".dashboard"
         ]
+        
         error_selectors = [
             '.error',
             '.alert',
             'text=Invalid',
             'text=Wrong',
-            'text=Failed'
+            'text=Failed',
+            'text=Incorrect'
         ]
+
         all_selectors = success_selectors + error_selectors
 
         try:
+            # Wait for any of these elements (max 60 seconds)
             element = await page.wait_for_selector(
                 ', '.join(all_selectors),
                 state="visible",
-                timeout=45000
+                timeout=60000
             )
+            
+            # Determine if it's a success or error element
             element_text = await element.text_content() or ""
-
-            # Determine success/failure
+            
+            # Check if the found element matches any success selector
             is_success = False
             for sel in success_selectors:
-                if sel.startswith("text="):
-                    expected = sel[5:].lower()
+                if sel.startswith("table[id$=") or sel.startswith("span#"):
+                    # CSS selector that matches an ID – assume success if found
+                    try:
+                        if await page.locator(sel).count() > 0:
+                            is_success = True
+                            break
+                    except:
+                        pass
+                elif "has-text" in sel:
+                    # Extract expected text from :has-text('...')
+                    import re
+                    match = re.search(r"has-text\('([^']+)'\)", sel)
+                    if match:
+                        expected = match.group(1).lower()
+                        if expected in element_text.lower():
+                            is_success = True
+                            break
+                elif sel.startswith("text="):
+                    expected = sel[5:].strip().lower()
                     if expected in element_text.lower():
                         is_success = True
                         break
                 else:
+                    # General CSS selector
                     try:
                         if await element.matches(sel):
                             is_success = True
                             break
                     except:
                         pass
-
+            
             if is_success:
-                logger.info("Login successful")
+                logger.info("Login successful - found dashboard element")
                 return {
                     'success': True,
                     'title': await page.title(),
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             else:
-                logger.info(f"Login failed: {element_text}")
+                error_text = element_text or "Login failed (unknown error)"
+                logger.info(f"Login failed - error: {error_text}")
                 return {
                     'success': False,
-                    'error': element_text or "Login failed",
+                    'error': error_text,
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-
+                
         except PlaywrightTimeoutError:
+            # No success or error indicator appeared within timeout
             logger.warning("Timeout waiting for result indicators")
             screenshot = await browser_manager.save_screenshot(page, "timeout")
             # Also log current URL and title for debugging
@@ -259,16 +311,30 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
             await page.close()
 
 async def on_startup():
+    """Initialize browser and health server on startup"""
     asyncio.create_task(start_health_server())
     await browser_manager.start()
 
 async def on_shutdown():
+    """Cleanup browser on shutdown"""
     await browser_manager.stop()
 
 async def main():
-    dp.startup.register(on_startup)
-    dp.shutdown.register(on_shutdown)
-    await dp.start_polling(bot)
+    """Main function"""
+    try:
+        # Register startup/shutdown handlers
+        dp.startup.register(on_startup)
+        dp.shutdown.register(on_shutdown)
+        
+        # Start polling
+        logger.info("Starting bot...")
+        await dp.start_polling(bot)
+    
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+    
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
