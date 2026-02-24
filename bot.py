@@ -101,14 +101,36 @@ async def start_health_server():
     await site.start()
     logger.info(f"Health server running on port {PORT}")
 
-# Inline keyboard after login (expanded menu)
+# Map of page names to URLs
+PAGES = {
+    "🏠 Dashboard": "https://noble.icrp.in/academic/Student-cp/Home_student.aspx",
+    "📋 Attendance": "https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx",
+    "👤 Profile": "https://noble.icrp.in/academic/Student-cp/Students_profile.aspx",
+    "📚 Academics": "https://noble.icrp.in/academic/Student-cp/Form_Display_Division_TimeTableS.aspx",
+    "💰 Fees": "https://noble.icrp.in/academic/Student-cp/Form_students_pay_fees.aspx",
+    "📝 Exam": "https://noble.icrp.in/academic/Student-cp/Form_Students_Exam_Result_Login.aspx",
+    "📅 Holidays": "https://noble.icrp.in/academic/Student-cp/List_Students_College_Wise_Holidays.aspx",
+    "🎓 Convocation": "https://noble.icrp.in/academic/Student-cp/Form_student_Convocation_Registration.aspx",
+}
+
+# Inline keyboard after login (two rows of pages, plus screenshot and logout)
 def get_main_menu():
-    buttons = [
-        [InlineKeyboardButton(text="📊 Attendance", callback_data="attendance"),
-         InlineKeyboardButton(text="📸 Screenshot", callback_data="screenshot")],
-        [InlineKeyboardButton(text="🏠 Dashboard", callback_data="dashboard"),
-         InlineKeyboardButton(text="🚪 Logout", callback_data="logout")]
-    ]
+    buttons = []
+    # First row: first 4 pages
+    row1 = []
+    for i, (name, url) in enumerate(list(PAGES.items())[:4]):
+        row1.append(InlineKeyboardButton(text=name, callback_data=f"page_{i}"))
+    buttons.append(row1)
+    # Second row: next 4 pages
+    row2 = []
+    for i, (name, url) in enumerate(list(PAGES.items())[4:8]):
+        row2.append(InlineKeyboardButton(text=name, callback_data=f"page_{i+4}"))
+    buttons.append(row2)
+    # Third row: screenshot and logout
+    buttons.append([
+        InlineKeyboardButton(text="📸 Screenshot", callback_data="screenshot"),
+        InlineKeyboardButton(text="🚪 Logout", callback_data="logout")
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 @dp.message(Command("start"))
@@ -300,122 +322,14 @@ async def close_user_page(chat_id: int):
         logger.info(f"Closed page for user {chat_id}")
 
 async def verify_logged_in(page: Page) -> bool:
-    """Check if we are still on a logged-in page"""
+    """Quick check if we are still on a logged-in page"""
     try:
+        # Look for a logout link or user name
         logout_link = await page.query_selector("a:has-text('Logout')")
         user_name = await page.query_selector("span#ctl00_lbl_name")
         return bool(logout_link or user_name)
     except:
         return False
-
-async def scrape_attendance(page: Page, chat_id: int) -> str:
-    """
-    Scrape attendance details from the attendance page.
-    If scraping fails, we return None and let the caller handle the screenshot.
-    """
-    try:
-        # First, verify we're still logged in
-        if not await verify_logged_in(page):
-            raise Exception("Session expired or not logged in")
-
-        # Navigate to attendance page
-        logger.info("Navigating to attendance page")
-        await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
-        await page.wait_for_timeout(2000)  # brief wait for Angular
-
-        # Wait for student details to load
-        await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
-        
-        # Extract student info
-        student_info = await page.evaluate('''() => {
-            const getText = (id) => {
-                const el = document.querySelector(id);
-                return el ? el.innerText.trim() : 'N/A';
-            };
-            return {
-                name: getText("span[id$='lbl_name']"),
-                enroll: getText("span[id$='lbl_enroll']"),
-                college: getText("span[id$='lbl_coll']"),
-                dept: getText("span[id$='lbl_dept']"),
-                course: getText("span[id$='lbl_course']"),
-                sem: getText("span[id$='lbl_sm']"),
-                div: getText("span[id$='lbl_div']"),
-                batch: getText("span[id$='lbl_batch']"),
-                term: getText("span[id$='lbl_term']")
-            };
-        }''')
-        
-        # Wait for attendance table data to load
-        try:
-            await page.wait_for_function('''
-                () => {
-                    const rows = document.querySelectorAll('tbody tr');
-                    if (rows.length === 0) return false;
-                    for (let row of rows) {
-                        const cells = row.querySelectorAll('td');
-                        if (cells.length >= 2 && cells[1].innerText.trim() !== '') {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-            ''', timeout=15000)
-            logger.info("Attendance data rows detected")
-        except PlaywrightTimeoutError:
-            # Maybe there is no data; try to find a "No records" message
-            no_data = await page.query_selector("text='Record Not Available..'")
-            if no_data:
-                logger.info("No attendance data available")
-                attendance_rows = []
-            else:
-                # No data and no message – fallback to screenshot
-                logger.warning("Attendance table not found, will send screenshot")
-                return None  # signal to send screenshot
-        else:
-            # Extract table rows
-            attendance_rows = await page.evaluate('''() => {
-                const rows = [];
-                document.querySelectorAll('tbody tr').forEach(tr => {
-                    const cells = tr.querySelectorAll('td');
-                    if (cells.length >= 8) {
-                        rows.push({
-                            month: cells[1]?.innerText.trim() || '',
-                            arranged: cells[2]?.innerText.trim() || '',
-                            remaining: cells[3]?.innerText.trim() || '',
-                            total: cells[4]?.innerText.trim() || '',
-                            absent: cells[5]?.innerText.trim() || '',
-                            present: cells[6]?.innerText.trim() || '',
-                            percent: cells[7]?.innerText.trim() || ''
-                        });
-                    }
-                });
-                return rows;
-            }''')
-            logger.info(f"Found {len(attendance_rows)} attendance rows")
-        
-        # Format message (plain text)
-        msg = f"📋 Attendance Details\n\n"
-        msg += f"Name: {student_info['name']}\n"
-        msg += f"Enrollment: {student_info['enroll']}\n"
-        msg += f"Course: {student_info['course']} - Semester {student_info['sem']}\n"
-        msg += f"Division: {student_info['div']}  Batch: {student_info['batch']}\n"
-        msg += f"Term: {student_info['term']}\n\n"
-        
-        if attendance_rows:
-            msg += "Month-wise Attendance\n"
-            header = f"{'Month':<12} {'Arr':>4} {'Rem':>4} {'Total':>5} {'Abs':>4} {'Pres':>4} {'%':>5}"
-            msg += header + "\n"
-            msg += "-" * len(header) + "\n"
-            for row in attendance_rows:
-                msg += f"{row['month']:<12} {row['arranged']:>4} {row['remaining']:>4} {row['total']:>5} {row['absent']:>4} {row['present']:>4} {row['percent']:>5}\n"
-        else:
-            msg += "No month-wise attendance data available.\n"
-        
-        return msg
-
-    except Exception as e:
-        logger.error(f"Error during attendance scraping: {e}")
-        return None  # signal to send screenshot
 
 @dp.callback_query()
 async def handle_menu_callback(callback: CallbackQuery):
@@ -428,22 +342,22 @@ async def handle_menu_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    if data == "attendance":
-        await callback.answer("Fetching attendance...")
+    if data.startswith("page_"):
+        # Extract page index
+        idx = int(data.split("_")[1])
+        page_name = list(PAGES.keys())[idx]
+        page_url = list(PAGES.values())[idx]
+        await callback.answer(f"Loading {page_name}...")
         try:
-            attendance_msg = await scrape_attendance(page, chat_id)
-            if attendance_msg:
-                await callback.message.answer(attendance_msg)
-            else:
-                # Scraping failed, take a screenshot and send it
-                screenshot_path = await browser_manager.save_screenshot(page, "attendance")
-                photo = FSInputFile(screenshot_path)
-                await callback.message.answer_photo(photo, caption="📸 Attendance page (unable to parse, here's a screenshot)")
-        except Exception as e:
-            logger.error(f"Attendance error: {e}")
-            screenshot_path = await browser_manager.save_screenshot(page, "attendance_error")
+            # Navigate quickly – use domcontentloaded for speed
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=30000)
+            # Take screenshot
+            screenshot_path = await browser_manager.save_screenshot(page, page_name.replace(" ", "_"))
             photo = FSInputFile(screenshot_path)
-            await callback.message.answer_photo(photo, caption="📸 Attendance page (error occurred)")
+            await callback.message.answer_photo(photo, caption=f"📸 {page_name}")
+        except Exception as e:
+            logger.error(f"Navigation error: {e}")
+            await callback.message.answer(f"❌ Failed to load {page_name}.")
         # Keep the menu
         await callback.message.edit_reply_markup(reply_markup=get_main_menu())
 
@@ -452,16 +366,11 @@ async def handle_menu_callback(callback: CallbackQuery):
         try:
             screenshot_path = await browser_manager.save_screenshot(page, "manual")
             photo = FSInputFile(screenshot_path)
-            await callback.message.answer_photo(photo, caption="📸 Current page screenshot")
+            await callback.message.answer_photo(photo, caption="📸 Current page")
         except Exception as e:
             logger.error(f"Screenshot error: {e}")
             await callback.message.answer("❌ Failed to take screenshot.")
         await callback.message.edit_reply_markup(reply_markup=get_main_menu())
-
-    elif data == "dashboard":
-        await callback.answer("Returning to dashboard...")
-        await page.goto("https://noble.icrp.in/academic/Student-cp/Home_student.aspx", wait_until="networkidle")
-        await callback.message.answer("🏠 You are back at the dashboard.", reply_markup=get_main_menu())
 
     elif data == "logout":
         await callback.answer("Logging out...")
