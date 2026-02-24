@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Dict, Optional
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -28,6 +29,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set")
 
+PORT = int(os.getenv("PORT", 10000))  # Render provides PORT
+
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
@@ -45,13 +48,14 @@ class BrowserManager:
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context = None
+        self.screenshot_counter = 0
     
     async def start(self):
         """Start browser instance"""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']  # Required for Render
+            args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         self.context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
@@ -72,9 +76,30 @@ class BrowserManager:
     async def new_page(self) -> Page:
         """Create a new page"""
         return await self.context.new_page()
+    
+    async def save_screenshot(self, page: Page, prefix: str = "debug") -> str:
+        """Save a screenshot for debugging"""
+        self.screenshot_counter += 1
+        filename = f"/tmp/{prefix}_{self.screenshot_counter}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        await page.screenshot(path=filename)
+        logger.info(f"Screenshot saved to {filename}")
+        return filename
 
 # Global browser manager
 browser_manager = BrowserManager()
+
+# Simple health check server
+async def health_check(request):
+    return web.Response(text="OK")
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health check server running on port {PORT}")
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
@@ -167,16 +192,19 @@ async def perform_login(username: str, password: str) -> Dict:
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # Wait for either success indicators OR error indicators (up to 30 seconds)
+        # Wait for either success indicators OR error indicators (up to 45 seconds)
         # Based on your after-login image, look for dashboard-specific elements
         success_selectors = [
-            "text=Faculty of Computer Application",  # from your image
-            "text=Dashboard",                         # heading in image
-            ".dashboard",                              # common class
-            "text=Attendance Details",                 # from image
-            "text=Syllabus Detail",                     # from image
-            "text=Recent Announcement",                 # from image
-            'a[href="logout.php"]'                      # typical logout link
+            "text=Faculty of Computer Application",
+            "text=Dashboard",
+            ".dashboard",
+            "text=Attendance Details",
+            "text=Syllabus Detail",
+            "text=Recent Announcement",
+            'a[href="logout.php"]',
+            "text=BCA1401",  # subject from your image
+            "text=Windows Application Development using C#.Net",
+            "text=MYSY 2025-26"  # announcement
         ]
         
         error_selectors = [
@@ -191,11 +219,11 @@ async def perform_login(username: str, password: str) -> Dict:
         # Combine selectors for waiting (wait for any of these to appear)
         all_selectors = success_selectors + error_selectors
         try:
-            # Wait for any of the selectors to appear (max 30 seconds)
+            # Wait for any of the selectors to appear (max 45 seconds)
             element = await page.wait_for_selector(
                 ', '.join(all_selectors),
                 state="visible",
-                timeout=30000
+                timeout=45000
             )
             
             # Determine if it's a success or error element
@@ -240,11 +268,11 @@ async def perform_login(username: str, password: str) -> Dict:
         except PlaywrightTimeoutError:
             # No success or error indicator appeared within timeout
             logger.warning("Timeout waiting for login result indicators")
-            # Take a screenshot for debugging (optional, could be saved)
-            # await page.screenshot(path="timeout_screenshot.png")
+            # Save screenshot for debugging
+            screenshot_path = await browser_manager.save_screenshot(page, "timeout")
             return {
                 'success': False,
-                'error': "Login timeout - no response from server",
+                'error': f"Login timeout - no response from server (screenshot saved: {screenshot_path})",
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
@@ -269,7 +297,11 @@ async def perform_login(username: str, password: str) -> Dict:
             await page.close()
 
 async def on_startup():
-    """Initialize browser on startup"""
+    """Initialize browser and health server on startup"""
+    # Start health check server
+    asyncio.create_task(start_health_server())
+    
+    # Start browser
     logger.info("Starting browser...")
     await browser_manager.start()
 
