@@ -143,127 +143,113 @@ async def process_password(message: Message, state: FSMContext):
 
 async def perform_login(username: str, password: str) -> Dict:
     """
-    Perform login using Playwright
-    
-    Args:
-        username: Username to login with
-        password: Password to login with
-    
-    Returns:
-        Dict with login result information
+    Perform login using Playwright with improved element-based waiting.
     """
     page = None
-    
     try:
-        # Create new page
         page = await browser_manager.new_page()
-        
-        # Set timeout
-        page.set_default_timeout(30000)  # 30 seconds
-        
+        page.set_default_timeout(60000)  # 60 seconds
+
         # Navigate to login page
         logger.info("Navigating to login page")
         await page.goto("https://noble.icrp.in/academic/", wait_until="networkidle")
         
-        # Wait for form to load
+        # Wait for username field
         await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=10000)
-        
-        # Get page info
-        page_title = await page.title()
-        logger.info(f"Page loaded: {page_title}")
-        
-        # Fill username
+        logger.info("Login page loaded")
+
+        # Fill credentials
         await page.fill('input[name="txt_uname"]', username)
-        logger.info("Username filled")
-        
-        # Fill password
         await page.fill('input[name="txt_password"]', password)
-        logger.info("Password filled")
-        
-        # Submit form
+        logger.info("Credentials filled")
+
+        # Click login – do NOT wait for navigation yet
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
+
+        # Wait for either success indicators OR error indicators (up to 30 seconds)
+        # Based on your after-login image, look for dashboard-specific elements
+        success_selectors = [
+            "text=Faculty of Computer Application",  # from your image
+            "text=Dashboard",                         # heading in image
+            ".dashboard",                              # common class
+            "text=Attendance Details",                 # from image
+            "text=Syllabus Detail",                     # from image
+            "text=Recent Announcement",                 # from image
+            'a[href="logout.php"]'                      # typical logout link
+        ]
         
-        # Wait for navigation/response
+        error_selectors = [
+            '.error',
+            '.alert',
+            'text=Invalid',
+            'text=Wrong',
+            'text=Failed',
+            'text=Incorrect'
+        ]
+
+        # Combine selectors for waiting (wait for any of these to appear)
+        all_selectors = success_selectors + error_selectors
         try:
-            # Wait for either dashboard elements or error message
-            await page.wait_for_url("**/academic/**", timeout=10000)
-            await page.wait_for_load_state("networkidle")
+            # Wait for any of the selectors to appear (max 30 seconds)
+            element = await page.wait_for_selector(
+                ', '.join(all_selectors),
+                state="visible",
+                timeout=30000
+            )
             
-            # Check if login was successful by looking for dashboard indicators
-            success_indicators = [
-                'a[href="logout.php"]',
-                '.dashboard',
-                'text=Logout',
-                'text=Welcome',
-                'text=Dashboard'
-            ]
+            # Determine if it's a success or error element
+            element_text = await element.text_content() or ""
+            element_tag = await page.evaluate('(el) => el.tagName', element)
             
-            login_successful = False
-            for selector in success_indicators:
-                try:
-                    element = await page.wait_for_selector(selector, timeout=5000)
-                    if element:
-                        login_successful = True
+            # Check if the found element matches any success selector
+            is_success = False
+            for sel in success_selectors:
+                if sel.startswith("text="):
+                    expected_text = sel[5:].strip().lower()
+                    if expected_text in element_text.lower():
+                        is_success = True
                         break
-                except:
-                    continue
-            
-            if login_successful:
-                final_url = page.url
-                final_title = await page.title()
-                
-                return {
-                    'success': True,
-                    'url': final_url,
-                    'title': final_title,
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-            else:
-                # Check for error message
-                error_elements = [
-                    '.error',
-                    '.alert',
-                    'text=Invalid',
-                    'text=Wrong',
-                    'text=Failed'
-                ]
-                
-                error_message = "Invalid credentials or login failed"
-                for selector in error_elements:
+                else:
+                    # Check if element matches the CSS selector
                     try:
-                        element = await page.wait_for_selector(selector, timeout=3000)
-                        if element:
-                            error_message = await element.text_content() or error_message
+                        if await element.matches(sel):
+                            is_success = True
                             break
                     except:
-                        continue
-                
-                return {
-                    'success': False,
-                    'error': error_message,
-                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-        except PlaywrightTimeoutError:
-            # Check current URL to determine if we're on dashboard
-            current_url = page.url
-            if "dashboard" in current_url.lower() or "welcome" in current_url.lower():
+                        pass
+            
+            if is_success:
+                logger.info("Login successful - found dashboard element")
                 return {
                     'success': True,
-                    'url': current_url,
+                    'url': page.url,
                     'title': await page.title(),
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             else:
+                # Error element found
+                error_text = element_text or "Login failed (unknown error)"
+                logger.info(f"Login failed - error: {error_text}")
                 return {
                     'success': False,
-                    'error': "Login timeout - server not responding",
+                    'error': error_text,
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-    
+                
+        except PlaywrightTimeoutError:
+            # No success or error indicator appeared within timeout
+            logger.warning("Timeout waiting for login result indicators")
+            # Take a screenshot for debugging (optional, could be saved)
+            # await page.screenshot(path="timeout_screenshot.png")
+            return {
+                'success': False,
+                'error': "Login timeout - no response from server",
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+
     except PlaywrightTimeoutError as e:
-        logger.error(f"Timeout error: {str(e)}")
+        logger.error(f"Timeout error during login: {str(e)}")
         return {
             'success': False,
             'error': "Page load timeout",
