@@ -114,7 +114,7 @@ def get_main_menu():
 async def cmd_start(message: Message, state: FSMContext):
     """Handle /start command"""
     await message.answer(
-        "🔐 Welcome!\n\nEnter your username:"
+        "🔐 Welcome!\n\nEnter your username2:"
     )
     await state.set_state(LoginStates.waiting_for_username)
 
