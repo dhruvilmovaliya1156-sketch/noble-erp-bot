@@ -1,36 +1,35 @@
-import asyncio
 import os
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message
-from flask import Flask
-from threading import Thread
+import logging
+from aiogram import Bot, Dispatcher, executor, types
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# Enable logging
+logging.basicConfig(level=logging.INFO)
+
+# Get token from Render Environment Variable
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set")
+    raise ValueError("No BOT_TOKEN found in environment variables")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
-# Flask app for Render
-app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "Bot is running!"
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
+# /start command
 @dp.message_handler(commands=["start"])
-async def start(message: Message):
-    await message.answer("🎓 Noble ERP Bot is Live!")
+async def start_command(message: types.Message):
+    await message.reply(
+        "🎓 Welcome to Noble University ERP Bot\n\n"
+        "Send your Username to login."
+    )
 
-async def run_bot():
-    await dp.start_polling(bot)
+
+# Simple echo (test)
+@dp.message_handler()
+async def echo(message: types.Message):
+    await message.reply(f"You said: {message.text}")
+
 
 if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    asyncio.run(run_bot())
+    print("Bot is starting...")
+    executor.start_polling(dp, skip_updates=True)
