@@ -29,7 +29,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable not set")
 
-PORT = int(os.getenv("PORT", 10000))  # Render provides PORT
+PORT = int(os.getenv("PORT", 10000))
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
@@ -42,16 +42,13 @@ class LoginStates(StatesGroup):
     waiting_for_password = State()
 
 class BrowserManager:
-    """Manages Playwright browser instances"""
-    
     def __init__(self):
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.context = None
         self.screenshot_counter = 0
-    
+
     async def start(self):
-        """Start browser instance"""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=True,
@@ -59,36 +56,32 @@ class BrowserManager:
         )
         self.context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
-        logger.info("Browser started successfully")
-    
+        logger.info("Browser started")
+
     async def stop(self):
-        """Stop browser instance"""
         if self.context:
             await self.context.close()
         if self.browser:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
-        logger.info("Browser stopped successfully")
-    
+        logger.info("Browser stopped")
+
     async def new_page(self) -> Page:
-        """Create a new page"""
         return await self.context.new_page()
-    
+
     async def save_screenshot(self, page: Page, prefix: str = "debug") -> str:
-        """Save a screenshot and return the file path"""
         self.screenshot_counter += 1
         filename = f"/tmp/{prefix}_{self.screenshot_counter}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
         await page.screenshot(path=filename)
         logger.info(f"Screenshot saved to {filename}")
         return filename
 
-# Global browser manager
 browser_manager = BrowserManager()
 
-# Simple health check server
+# Health check server
 async def health_check(request):
     return web.Response(text="OK")
 
@@ -99,148 +92,122 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Health check server running on port {PORT}")
+    logger.info(f"Health server on port {PORT}")
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    """Handle /start command"""
     await message.answer(
-        "🔐 Welcome to Login Bot!\n\n"
-        "This bot will help you test login to Noble ICRP Academic portal.\n\n"
-        "Please enter your username:"
+        "🔐 Welcome!\n\nEnter your username:"
     )
     await state.set_state(LoginStates.waiting_for_username)
 
 @dp.message(LoginStates.waiting_for_username)
 async def process_username(message: Message, state: FSMContext):
-    """Process username input"""
     username = message.text.strip()
-    
     if not username:
-        await message.answer("❌ Username cannot be empty. Please enter your username:")
+        await message.answer("Username cannot be empty. Try again:")
         return
-    
     await state.update_data(username=username)
-    await message.answer("Please enter your password:")
+    await message.answer("Now enter your password:")
     await state.set_state(LoginStates.waiting_for_password)
 
 @dp.message(LoginStates.waiting_for_password)
 async def process_password(message: Message, state: FSMContext):
-    """Process password input and perform login"""
     password = message.text.strip()
-    
     if not password:
-        await message.answer("❌ Password cannot be empty. Please enter your password:")
+        await message.answer("Password cannot be empty. Try again:")
         return
-    
-    # Get stored username
+
     data = await state.get_data()
     username = data.get('username')
-    
-    # Clear state immediately for security
     await state.clear()
-    
-    # Send processing message
-    processing_msg = await message.answer("🔄 Processing login... Please wait.")
-    
+
+    processing = await message.answer("🔄 Logging in...")
+
     try:
-        # Perform login
         result = await perform_login(username, password, message.chat.id)
-        
-        # Send result
+
         if result['success']:
             await message.answer(
-                f"✅ Login Successful!\n\n"
+                f"✅ Login Successful!\n"
                 f"Time: {result['timestamp']}\n"
-                f"Page Title: {result.get('title', 'N/A')}"
+                f"Title: {result.get('title', 'N/A')}"
             )
         else:
             error_msg = result.get('error', 'Unknown error')
-            await message.answer(f"❌ Login Failed!\n\nReason: {error_msg}")
-            
-            # If a screenshot was saved, send it
+            await message.answer(f"❌ Login Failed!\nReason: {error_msg}")
+
+            # Send screenshot if available
             if result.get('screenshot'):
                 try:
                     photo = FSInputFile(result['screenshot'])
-                    await message.answer_photo(photo, caption="📸 Screenshot at timeout")
+                    await message.answer_photo(photo, caption="📸 Page after login attempt")
                 except Exception as e:
                     logger.error(f"Failed to send screenshot: {e}")
-    
+                    # Fallback: send as document
+                    try:
+                        doc = FSInputFile(result['screenshot'])
+                        await message.answer_document(doc, caption="📸 Screenshot (as file)")
+                    except:
+                        pass
+
     except Exception as e:
-        logger.error(f"Login error: {str(e)}")
-        await message.answer(f"❌ An error occurred during login. Please try again later.")
-    
+        logger.error(f"Login error: {e}")
+        await message.answer("❌ Unexpected error. Try later.")
     finally:
-        # Delete processing message
-        await processing_msg.delete()
+        await processing.delete()
 
 async def perform_login(username: str, password: str, chat_id: int) -> Dict:
-    """
-    Perform login using Playwright with screenshot on timeout.
-    """
     page = None
     try:
         page = await browser_manager.new_page()
-        page.set_default_timeout(60000)  # 60 seconds
+        page.set_default_timeout(60000)
 
-        # Navigate to login page
         logger.info("Navigating to login page")
         await page.goto("https://noble.icrp.in/academic/", wait_until="networkidle")
-        
-        # Wait for username field
-        await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=10000)
+        await page.wait_for_selector('input[name="txt_uname"]', timeout=10000)
         logger.info("Login page loaded")
 
-        # Fill credentials
         await page.fill('input[name="txt_uname"]', username)
         await page.fill('input[name="txt_password"]', password)
         logger.info("Credentials filled")
 
-        # Click login – do NOT wait for navigation yet
         await page.click('input[type="submit"]')
         logger.info("Login button clicked")
 
-        # Wait for either success indicators OR error indicators (up to 45 seconds)
+        # Wait for any known element (dashboard or error)
         success_selectors = [
             "text=Faculty of Computer Application",
             "text=Dashboard",
-            ".dashboard",
             "text=Attendance Details",
             "text=Syllabus Detail",
             "text=Recent Announcement",
-            'a[href="logout.php"]',
             "text=BCA1401",
-            "text=Windows Application Development using C#.Net",
-            "text=MYSY 2025-26"
+            'a[href="logout.php"]'
         ]
-        
         error_selectors = [
             '.error',
             '.alert',
             'text=Invalid',
             'text=Wrong',
-            'text=Failed',
-            'text=Incorrect'
+            'text=Failed'
         ]
-
         all_selectors = success_selectors + error_selectors
+
         try:
-            # Wait for any of the selectors to appear (max 45 seconds)
             element = await page.wait_for_selector(
                 ', '.join(all_selectors),
                 state="visible",
                 timeout=45000
             )
-            
-            # Determine if it's a success or error element
             element_text = await element.text_content() or ""
-            
-            # Check if the found element matches any success selector
+
+            # Determine success/failure
             is_success = False
             for sel in success_selectors:
                 if sel.startswith("text="):
-                    expected_text = sel[5:].strip().lower()
-                    if expected_text in element_text.lower():
+                    expected = sel[5:].lower()
+                    if expected in element_text.lower():
                         is_success = True
                         break
                 else:
@@ -250,85 +217,58 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
                             break
                     except:
                         pass
-            
+
             if is_success:
-                logger.info("Login successful - found dashboard element")
+                logger.info("Login successful")
                 return {
                     'success': True,
-                    'url': page.url,
                     'title': await page.title(),
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
             else:
-                error_text = element_text or "Login failed (unknown error)"
-                logger.info(f"Login failed - error: {error_text}")
+                logger.info(f"Login failed: {element_text}")
                 return {
                     'success': False,
-                    'error': error_text,
+                    'error': element_text or "Login failed",
                     'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 }
-                
+
         except PlaywrightTimeoutError:
-            # No success or error indicator appeared within timeout
-            logger.warning("Timeout waiting for login result indicators")
-            screenshot_path = await browser_manager.save_screenshot(page, "timeout")
+            logger.warning("Timeout waiting for result indicators")
+            screenshot = await browser_manager.save_screenshot(page, "timeout")
+            # Also log current URL and title for debugging
+            current_url = page.url
+            current_title = await page.title()
+            logger.info(f"Current URL: {current_url}, Title: {current_title}")
             return {
                 'success': False,
-                'error': "Login timeout - no response from server. Screenshot attached.",
-                'screenshot': screenshot_path,
+                'error': f"Login timeout - no response. URL: {current_url}, Title: {current_title}",
+                'screenshot': screenshot,
                 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
-    except PlaywrightTimeoutError as e:
-        logger.error(f"Timeout error during login: {str(e)}")
-        return {
-            'success': False,
-            'error': "Page load timeout",
-            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    
     except Exception as e:
-        logger.error(f"Browser automation error: {str(e)}")
+        logger.error(f"Automation error: {e}")
         return {
             'success': False,
             'error': f"Automation error: {str(e)[:100]}",
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-    
     finally:
         if page:
             await page.close()
 
 async def on_startup():
-    """Initialize browser and health server on startup"""
-    # Start health check server
     asyncio.create_task(start_health_server())
-    
-    # Start browser
-    logger.info("Starting browser...")
     await browser_manager.start()
 
 async def on_shutdown():
-    """Cleanup browser on shutdown"""
-    logger.info("Stopping browser...")
     await browser_manager.stop()
 
 async def main():
-    """Main function"""
-    try:
-        # Register startup/shutdown handlers
-        dp.startup.register(on_startup)
-        dp.shutdown.register(on_shutdown)
-        
-        # Start polling
-        logger.info("Starting bot...")
-        await dp.start_polling(bot)
-    
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
-    
-    finally:
-        await bot.session.close()
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
