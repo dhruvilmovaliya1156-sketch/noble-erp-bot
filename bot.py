@@ -101,12 +101,13 @@ async def start_health_server():
     await site.start()
     logger.info(f"Health server running on port {PORT}")
 
-# Inline keyboard after login
+# Inline keyboard after login (expanded menu)
 def get_main_menu():
     buttons = [
-        [InlineKeyboardButton(text="📊 Attendance", callback_data="attendance")],
-        [InlineKeyboardButton(text="🏠 Dashboard", callback_data="dashboard")],
-        [InlineKeyboardButton(text="🚪 Logout", callback_data="logout")]
+        [InlineKeyboardButton(text="📊 Attendance", callback_data="attendance"),
+         InlineKeyboardButton(text="📸 Screenshot", callback_data="screenshot")],
+        [InlineKeyboardButton(text="🏠 Dashboard", callback_data="dashboard"),
+         InlineKeyboardButton(text="🚪 Logout", callback_data="logout")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -310,8 +311,7 @@ async def verify_logged_in(page: Page) -> bool:
 async def scrape_attendance(page: Page, chat_id: int) -> str:
     """
     Scrape attendance details from the attendance page.
-    Waits for actual data rows using a custom JavaScript condition.
-    Raises an exception with screenshot if any step fails.
+    If scraping fails, we return None and let the caller handle the screenshot.
     """
     try:
         # First, verify we're still logged in
@@ -321,10 +321,10 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         # Navigate to attendance page
         logger.info("Navigating to attendance page")
         await page.goto("https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx", wait_until="networkidle")
-        await page.wait_for_timeout(3000)  # brief wait for Angular
+        await page.wait_for_timeout(2000)  # brief wait for Angular
 
         # Wait for student details to load
-        await page.wait_for_selector("span[id$='lbl_name']", timeout=15000)
+        await page.wait_for_selector("span[id$='lbl_name']", timeout=10000)
         
         # Extract student info
         student_info = await page.evaluate('''() => {
@@ -346,7 +346,6 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         }''')
         
         # Wait for attendance table data to load
-        # We wait until at least one row has a non-empty month cell
         try:
             await page.wait_for_function('''
                 () => {
@@ -360,7 +359,7 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
                     }
                     return false;
                 }
-            ''', timeout=20000)
+            ''', timeout=15000)
             logger.info("Attendance data rows detected")
         except PlaywrightTimeoutError:
             # Maybe there is no data; try to find a "No records" message
@@ -369,9 +368,9 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
                 logger.info("No attendance data available")
                 attendance_rows = []
             else:
-                # If no rows and no message, take screenshot and raise
-                screenshot = await browser_manager.save_screenshot(page, "attendance_no_table")
-                raise Exception(f"Attendance table not found. Screenshot: {screenshot}")
+                # No data and no message – fallback to screenshot
+                logger.warning("Attendance table not found, will send screenshot")
+                return None  # signal to send screenshot
         else:
             # Extract table rows
             attendance_rows = await page.evaluate('''() => {
@@ -415,45 +414,53 @@ async def scrape_attendance(page: Page, chat_id: int) -> str:
         return msg
 
     except Exception as e:
-        # Take screenshot and re-raise with screenshot path
-        screenshot = await browser_manager.save_screenshot(page, "attendance_error")
-        raise Exception(f"Attendance fetch failed: {str(e)}. Screenshot: {screenshot}")
+        logger.error(f"Error during attendance scraping: {e}")
+        return None  # signal to send screenshot
 
 @dp.callback_query()
 async def handle_menu_callback(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     data = callback.data
 
+    page = user_pages.get(chat_id)
+    if not page:
+        await callback.message.answer("❌ You are not logged in. Please use /start to login.")
+        await callback.answer()
+        return
+
     if data == "attendance":
         await callback.answer("Fetching attendance...")
-        page = user_pages.get(chat_id)
-        if not page:
-            await callback.message.answer("❌ You are not logged in. Please use /start to login.")
-            return
         try:
             attendance_msg = await scrape_attendance(page, chat_id)
-            await callback.message.answer(attendance_msg)
+            if attendance_msg:
+                await callback.message.answer(attendance_msg)
+            else:
+                # Scraping failed, take a screenshot and send it
+                screenshot_path = await browser_manager.save_screenshot(page, "attendance")
+                photo = FSInputFile(screenshot_path)
+                await callback.message.answer_photo(photo, caption="📸 Attendance page (unable to parse, here's a screenshot)")
         except Exception as e:
             logger.error(f"Attendance error: {e}")
-            error_str = str(e)
-            # If screenshot is mentioned, extract path and send it
-            if "Screenshot:" in error_str:
-                parts = error_str.split("Screenshot:")
-                screenshot_path = parts[1].strip()
-                try:
-                    photo = FSInputFile(screenshot_path)
-                    await callback.message.answer_photo(photo, caption="📸 Error screenshot")
-                except:
-                    pass
-            await callback.message.answer("❌ Failed to fetch attendance. See error above.")
+            screenshot_path = await browser_manager.save_screenshot(page, "attendance_error")
+            photo = FSInputFile(screenshot_path)
+            await callback.message.answer_photo(photo, caption="📸 Attendance page (error occurred)")
         # Keep the menu
+        await callback.message.edit_reply_markup(reply_markup=get_main_menu())
+
+    elif data == "screenshot":
+        await callback.answer("Taking screenshot...")
+        try:
+            screenshot_path = await browser_manager.save_screenshot(page, "manual")
+            photo = FSInputFile(screenshot_path)
+            await callback.message.answer_photo(photo, caption="📸 Current page screenshot")
+        except Exception as e:
+            logger.error(f"Screenshot error: {e}")
+            await callback.message.answer("❌ Failed to take screenshot.")
         await callback.message.edit_reply_markup(reply_markup=get_main_menu())
 
     elif data == "dashboard":
         await callback.answer("Returning to dashboard...")
-        page = user_pages.get(chat_id)
-        if page:
-            await page.goto("https://noble.icrp.in/academic/Student-cp/Home_student.aspx", wait_until="networkidle")
+        await page.goto("https://noble.icrp.in/academic/Student-cp/Home_student.aspx", wait_until="networkidle")
         await callback.message.answer("🏠 You are back at the dashboard.", reply_markup=get_main_menu())
 
     elif data == "logout":
