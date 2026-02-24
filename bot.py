@@ -139,19 +139,14 @@ async def process_password(message: Message, state: FSMContext):
 
     data = await state.get_data()
     username = data.get('username')
-    # Clear state immediately for security
     await state.clear()
 
     processing = await message.answer("🔄 Logging in...")
 
     try:
-        # Perform login
         login_result = await perform_login(username, password, message.chat.id)
 
         if login_result['success']:
-            # Store page and context info in user data (or keep in memory)
-            # We'll use a simple dict to store the page for this user
-            # For now, just show the menu
             await message.answer(
                 f"✅ Login Successful!\nTime: {login_result['timestamp']}",
                 reply_markup=get_main_menu()
@@ -160,7 +155,6 @@ async def process_password(message: Message, state: FSMContext):
             error_msg = login_result.get('error', 'Unknown error')
             await message.answer(f"❌ Login Failed!\nReason: {error_msg}")
 
-            # Send screenshot if available
             if login_result.get('screenshot'):
                 try:
                     photo = FSInputFile(login_result['screenshot'])
@@ -187,12 +181,15 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
     page = None
     try:
         page = await browser_manager.new_page()
-        page.set_default_timeout(60000)
+        page.set_default_timeout(60000)  # 60 seconds default
 
         # Navigate to login page
         logger.info("Navigating to login page")
         await page.goto("https://noble.icrp.in/academic/", wait_until="networkidle")
-        await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=10000)
+        
+        # Wait for username field (increased timeout to 30 seconds)
+        logger.info("Waiting for username field")
+        await page.wait_for_selector('input[name="txt_uname"]', state="visible", timeout=30000)
         logger.info("Login page loaded")
 
         # Fill credentials
@@ -221,13 +218,14 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
         except PlaywrightTimeoutError:
             pass  # No error message
 
-        # Wait for navigation to dashboard URL
+        # Wait for navigation to dashboard URL (30 seconds)
         try:
             await page.wait_for_url("**/Home_student.aspx**", timeout=30000)
             await page.wait_for_load_state("networkidle")
             logger.info("Navigation to dashboard detected")
         except PlaywrightTimeoutError:
             # Fallback: check for dashboard elements
+            logger.warning("No navigation to dashboard within timeout, checking elements")
             dashboard_selectors = [
                 "table[id$='grd_syllabus']",
                 "table[id$='grd_notif']",
@@ -265,16 +263,23 @@ async def perform_login(username: str, password: str, chat_id: int) -> Dict:
         except PlaywrightTimeoutError:
             logger.info("No announcement popup found")
 
-        # Store the page in a global dict for this user (chat_id)
-        # We'll use a simple dict; in production consider using a more robust storage
+        # Store the page for this user
         user_pages[chat_id] = page
-        # Return success, but don't close the page yet
         return {
             'success': True,
             'title': await page.title(),
             'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
 
+    except PlaywrightTimeoutError as e:
+        logger.error(f"Playwright timeout during login: {e}")
+        screenshot = await browser_manager.save_screenshot(page, "timeout") if page else None
+        return {
+            'success': False,
+            'error': f"Timeout during login: {str(e)}",
+            'screenshot': screenshot,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
     except Exception as e:
         logger.error(f"Automation error: {e}")
         return {
