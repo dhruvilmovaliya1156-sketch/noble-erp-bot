@@ -385,134 +385,123 @@ async def extract_fees(page) -> dict:
 
 async def extract_attendance(page) -> dict:
     """
-    Extract attendance from two tables on the page:
+    Extract attendance from two sources:
 
-    1. Month-wise table (Angular rendered) — we call the API endpoint directly
-       POST /Student-cp/Form_Students_Lecture_Wise_Attendance.aspx/ListAttendanceStudent
-       Returns JSON with fields: month, total_arrange_lect, remaning,
-       total_lecture_for_stud, absent_lecture, present_lecture, persentage
+    1. Month-wise: POST to the Angular API endpoint using aiohttp
+       (cookies from the browser session are copied so auth works)
 
-    2. Lecture-wise table (server-rendered) — already in the HTML:
-       - <th> headers: "01/02<br/>Sun" format
-       - <td class="divtooltip"> cells with P/A/H/S/R in a <div>
-       - <span class="tooltiptext"> with Faculty and Topic info
+    2. Lecture-wise: synchronous page.evaluate() on the already server-rendered
+       table inside div[id*=div_lec_att]
     """
     try:
-        await page.goto(PAGE_VALS[PAGE_KEYS.index("\U0001f4cb Attendance")], wait_until="networkidle")
+        await page.goto(PAGE_VALS[PAGE_KEYS.index("📋 Attendance")], wait_until="networkidle")
         await asyncio.sleep(1)
 
-        data = await page.evaluate("""
-        async () => {
-            // ── 1. Month-wise data via Angular API ──────────────────────
-            let monthly = [];
-            try {
-                const resp = await fetch(
-                    '/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx/ListAttendanceStudent',
-                    {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: '{}'
-                    }
-                );
-                const json = await resp.json();
-                // The response wraps data in .d as a JSON string
-                const arr = typeof json.d === 'string' ? JSON.parse(json.d) : json.d;
-                if (Array.isArray(arr)) {
-                    monthly = arr.map((c, i) => ({
-                        sr: i + 1,
-                        month: c.month || '',
-                        total_arranged: c.total_arrange_lect || 0,
-                        remaining: c.remaning || 0,
-                        total_lectures: c.total_lecture_for_stud || 0,
-                        absent: c.absent_lecture || 0,
-                        present: c.present_lecture || 0,
-                        percentage: c.persentage || 0,
-                    }));
-                }
-            } catch(e) {
-                monthly = [];
-            }
+        # ── 1. Month-wise via Python aiohttp (avoids async in evaluate) ─
+        monthly = []
+        try:
+            import aiohttp as _aiohttp
 
-            // ── 2. Lecture-wise table (server-rendered) ─────────────────
-            const lectures = [];
+            # Grab cookies from the Playwright page so the request is authenticated
+            cookies_list = await page.context.cookies()
+            cookie_jar = {c["name"]: c["value"] for c in cookies_list}
 
-            // Find the lecture-wise table — it's inside div#..._div_lec_att
-            const lecDiv = document.querySelector('[id*="div_lec_att"]');
-            if (!lecDiv) return { monthly, lectures, student: {} };
+            api_url = "https://noble.icrp.in/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx/ListAttendanceStudent"
+            async with _aiohttp.ClientSession(cookies=cookie_jar) as sess:
+                async with sess.post(
+                    api_url,
+                    json={},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Referer": PAGE_VALS[PAGE_KEYS.index("📋 Attendance")],
+                    },
+                    timeout=_aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    raw = await resp.json(content_type=None)
+                    # Response wraps data in .d which may be a JSON string
+                    d = raw.get("d", [])
+                    if isinstance(d, str):
+                        d = json.loads(d)
+                    if isinstance(d, list):
+                        for i, c in enumerate(d):
+                            monthly.append({
+                                "sr":             i + 1,
+                                "month":          c.get("month", ""),
+                                "total_arranged": c.get("total_arrange_lect", 0),
+                                "remaining":      c.get("remaning", 0),
+                                "total_lectures": c.get("total_lecture_for_stud", 0),
+                                "absent":         c.get("absent_lecture", 0),
+                                "present":        c.get("present_lecture", 0),
+                                "percentage":     c.get("persentage", 0),
+                            })
+        except Exception as e:
+            logger.warning(f"Monthly API call failed: {e}")
+            monthly = []
 
-            // The table is the first table inside lecDiv
-            const table = lecDiv.querySelector('table');
-            if (!table) return { monthly, lectures, student: {} };
+        # ── 2. Lecture-wise DOM scraping ─────────────────────────────────
+        # NOTE: JS is built as a Python string to avoid quote-escaping issues
+        # with the str_replace tool mangling single quotes inside triple-quotes.
+        _js_att = (
+            "() => {"
+            "  const lectures = [];"
+            "  const lecDiv = document.querySelector(\"[id*='div_lec_att']\");"
+            "  if (!lecDiv) return { lectures: [], student: {}, headers: [] };"
+            "  const table = lecDiv.querySelector(\"table\");"
+            "  if (!table) return { lectures: [], student: {}, headers: [] };"
+            "  const headerThs = Array.from(table.querySelectorAll(\"th\"));"
+            "  const headers = headerThs.map(th => th.innerText.trim().replace(/ +/g, \" \").replace(/\\n/g, \" \"));"
+            "  const rows = Array.from(table.querySelectorAll(\"tr\")).slice(1);"
+            "  for (const row of rows) {"
+            "    const cells = Array.from(row.querySelectorAll(\"td\"));"
+            "    if (cells.length < 2) continue;"
+            "    const slotNum = cells[0].innerText.trim();"
+            "    if (!slotNum || isNaN(parseInt(slotNum))) continue;"
+            "    const days = [];"
+            "    for (let i = 1; i < cells.length; i++) {"
+            "      const cell = cells[i];"
+            "      const header = headers[i] || \"\";"
+            "      const statusDiv = cell.querySelector(\"div\");"
+            "      let status = statusDiv ? statusDiv.innerText.trim() : cell.innerText.trim();"
+            "      if (!status) status = \"-\";"
+            "      const tooltip = cell.querySelector(\".tooltiptext\");"
+            "      let faculty = \"\", topic = \"\", reason = \"\";"
+            "      if (tooltip) {"
+            "        const h = tooltip.innerHTML;"
+            "        const fm = h.match(/Faculty:[^>]*>([^<]+)/);"
+            "        const tm = h.match(/Topic:[^>]*>([^<]+)/);"
+            "        const rm = h.match(/Reason:[^>]*>([^<]*)/);"
+            "        faculty = fm ? fm[1].trim() : \"\";"
+            "        topic   = tm ? tm[1].trim() : \"\";"
+            "        reason  = rm ? rm[1].trim() : \"\";"
+            "      }"
+            "      days.push({ date: header, status: status, faculty: faculty, topic: topic, reason: reason });"
+            "    }"
+            "    lectures.push({ slot: parseInt(slotNum), days: days });"
+            "  }"
+            "  const g = function(id) { const e = document.getElementById(id); return e ? e.innerText.trim() : \"\"; };"
+            "  const student = {"
+            "    name:       g(\"ctl00_ContentPlaceHolder1_lbl_name\"),"
+            "    enrollment: g(\"ctl00_ContentPlaceHolder1_lbl_enroll\"),"
+            "    college:    g(\"ctl00_ContentPlaceHolder1_lbl_coll\"),"
+            "    department: g(\"ctl00_ContentPlaceHolder1_lbl_dept\"),"
+            "    course:     g(\"ctl00_ContentPlaceHolder1_lbl_course\"),"
+            "    semester:   g(\"ctl00_ContentPlaceHolder1_lbl_sm\"),"
+            "    division:   g(\"ctl00_ContentPlaceHolder1_lbl_div\"),"
+            "    batch:      g(\"ctl00_ContentPlaceHolder1_lbl_batch\"),"
+            "    term:       g(\"ctl00_ContentPlaceHolder1_lbl_term\")"
+            "  };"
+            "  return { lectures: lectures, student: student, headers: headers };"
+            "}"
+        )
+        dom_data = await page.evaluate(_js_att)
 
-            // Parse header row — each <th> has text like "01/02\nSun"
-            const headerThs = Array.from(table.querySelectorAll('th'));
-            const headers = headerThs.map(th => {
-                // innerText gives "01/02\nSun" → we want "01/02 Sun"
-                return th.innerText.trim().replace(/\s+/g, ' ');
-            });
-            // headers[0] is "#" (row number)
-
-            // Parse data rows
-            const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
-            for (const row of rows) {
-                const cells = Array.from(row.querySelectorAll('td'));
-                if (cells.length < 2) continue;
-
-                // First cell: lecture slot number (1,2,3...)
-                const slotNum = cells[0].innerText.trim();
-                if (!slotNum || isNaN(parseInt(slotNum))) continue;
-
-                const days = [];
-                for (let i = 1; i < cells.length; i++) {
-                    const cell = cells[i];
-                    const header = headers[i] || '';
-
-                    // Get status from the colored div inside
-                    const statusDiv = cell.querySelector('div');
-                    const status = statusDiv ? statusDiv.innerText.trim() : (cell.innerText.trim() === '-' ? '-' : '');
-
-                    // Get tooltip (faculty + topic)
-                    const tooltip = cell.querySelector('.tooltiptext');
-                    let faculty = '', topic = '', reason = '';
-                    if (tooltip) {
-                        const html = tooltip.innerHTML;
-                        const facMatch = html.match(/Faculty:.*?<\/b>([^<]+)/);
-                        const topicMatch = html.match(/Topic:.*?<\/b>([^<]+)/);
-                        const reasonMatch = html.match(/Reason:.*?<\/b>([^<]*)/);
-                        faculty = facMatch ? facMatch[1].trim() : '';
-                        topic   = topicMatch ? topicMatch[1].trim() : '';
-                        reason  = reasonMatch ? reasonMatch[1].trim() : '';
-                    }
-
-                    days.push({ date: header, status, faculty, topic, reason });
-                }
-
-                lectures.push({ slot: parseInt(slotNum), days });
-            }
-
-            // ── 3. Student info from the form ───────────────────────────
-            const getText = (id) => {
-                const el = document.getElementById(id);
-                return el ? el.innerText.trim() : '';
-            };
-            const student = {
-                name:       getText('ctl00_ContentPlaceHolder1_lbl_name'),
-                enrollment: getText('ctl00_ContentPlaceHolder1_lbl_enroll'),
-                college:    getText('ctl00_ContentPlaceHolder1_lbl_coll'),
-                department: getText('ctl00_ContentPlaceHolder1_lbl_dept'),
-                course:     getText('ctl00_ContentPlaceHolder1_lbl_course'),
-                semester:   getText('ctl00_ContentPlaceHolder1_lbl_sm'),
-                division:   getText('ctl00_ContentPlaceHolder1_lbl_div'),
-                batch:      getText('ctl00_ContentPlaceHolder1_lbl_batch'),
-                term:       getText('ctl00_ContentPlaceHolder1_lbl_term'),
-            };
-
-            return { monthly, lectures, student, headers };
+        return {
+            "monthly":   monthly,
+            "lectures":  dom_data.get("lectures", []),
+            "student":   dom_data.get("student", {}),
+            "headers":   dom_data.get("headers", []),
+            "extracted_at": datetime.now().isoformat(),
         }
-        """)
-
-        data["extracted_at"] = datetime.now().isoformat()
-        return data
 
     except Exception as e:
         logger.error(f"extract_attendance error: {e}")
