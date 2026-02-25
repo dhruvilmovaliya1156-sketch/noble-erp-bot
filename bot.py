@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import logging
@@ -1359,7 +1360,41 @@ async def on_shutdown():
 async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    await dp.start_polling(bot)
+
+    # ── Conflict-safe startup ────────────────────────────────────
+    # On Render/Railway the old instance may still be alive for a
+    # few seconds after deploy. Drop the webhook + stale updates,
+    # then back off if another instance is still polling.
+    logger.info("Clearing webhook and pending updates...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"delete_webhook failed (non-fatal): {e}")
+
+    max_retries = 10
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"Starting polling (attempt {attempt}/{max_retries})...")
+            await dp.start_polling(
+                bot,
+                allowed_updates=dp.resolve_used_update_types(),
+                drop_pending_updates=True,
+            )
+            break
+        except Exception as e:
+            err = str(e)
+            if "Conflict" in err or "terminated by other" in err:
+                wait = 5 * attempt
+                logger.warning(
+                    f"Conflict: another instance running. "
+                    f"Retrying in {wait}s ({attempt}/{max_retries})..."
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"Fatal polling error: {e}")
+                raise
+    else:
+        logger.error("Could not start polling after max retries.")
 
 if __name__ == "__main__":
     asyncio.run(main())
