@@ -226,6 +226,18 @@ def get_menu():
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def get_attendance_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 View Daily Log", callback_data="att_daily")],
+        [InlineKeyboardButton(text="🔙 Back to Menu",   callback_data="show_menu")],
+    ])
+
+def get_fees_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 All Transactions", callback_data="fees_detail")],
+        [InlineKeyboardButton(text="🔙 Back to Menu",      callback_data="show_menu")],
+    ])
+
 def get_back_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="show_menu")]
@@ -258,104 +270,500 @@ async def verify_logged_in(page) -> bool:
 
 # ================= ERP DATA EXTRACTORS =================
 
+def _clean(text: str) -> str:
+    """Strip whitespace and normalize spaces."""
+    return re.sub(r"\s+", " ", text.strip())
+
+def _is_junk(text: str) -> bool:
+    """Detect Angular un-rendered template literals or empty cells."""
+    return (
+        not text
+        or "{{" in text
+        or "}}" in text
+        or text in ("-", "—", "/", "P", "H", "A", "S")
+    )
+
+async def _wait_for_angular(page, timeout: int = 10000):
+    """Wait until Angular template placeholders are gone from the DOM."""
+    try:
+        await page.wait_for_function(
+            "() => !document.body.innerText.includes('{{') && !document.body.innerText.includes('}}')",
+            timeout=timeout,
+        )
+    except Exception:
+        pass  # proceed anyway; we'll filter junk rows ourselves
+
+# ─────────────────────────────────────────────────────────────
+#  FEES  ─  The ERP table repeats cell text across columns due
+#            to nested <span> / Angular bindings. We use JS to
+#            read each row by fixed column index (0=Sr, 1=Type,
+#            2=Amount, 3=Payment Mode) and skip duplicate rows.
+# ─────────────────────────────────────────────────────────────
+async def extract_fees(page) -> dict:
+    try:
+        await page.goto(PAGE_VALS[PAGE_KEYS.index("💰 Fees")], wait_until="networkidle")
+        await _wait_for_angular(page)
+
+        fees = await page.evaluate("""
+        () => {
+            const results = [];
+            let totalPaid = 0;
+
+            // Try every table on the page; pick the one that looks like fees
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+                const rows = Array.from(table.querySelectorAll('tr'));
+                if (rows.length < 2) continue;
+
+                // Check header row to identify the correct table
+                const headerCells = Array.from(rows[0].querySelectorAll('th, td'))
+                                        .map(c => c.innerText.trim().toLowerCase());
+                const looksLikeFees = headerCells.some(h =>
+                    h.includes('fee') || h.includes('amount') || h.includes('sr')
+                );
+                if (!looksLikeFees) continue;
+
+                for (const row of rows.slice(1)) {
+                    const cells = Array.from(row.querySelectorAll('td'));
+                    if (cells.length < 3) continue;
+
+                    // Each cell may have nested elements; take only direct text
+                    const getCellText = (cell) => {
+                        // Grab first non-empty text node or innerText as fallback
+                        for (const node of cell.childNodes) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                const t = node.textContent.trim();
+                                if (t) return t;
+                            }
+                        }
+                        // Fallback: first span/input value
+                        const spans = cell.querySelectorAll('span, label');
+                        for (const s of spans) {
+                            const t = s.innerText.trim();
+                            if (t && !t.includes('{{')) return t;
+                        }
+                        // Last resort: full innerText deduplicated
+                        const full = cell.innerText.trim();
+                        const parts = full.split('\\n').map(p => p.trim()).filter(Boolean);
+                        // Remove duplicates that appear consecutively
+                        const unique = [];
+                        for (const p of parts) {
+                            if (unique[unique.length - 1] !== p) unique.push(p);
+                        }
+                        return unique[0] || '';
+                    };
+
+                    const sr          = getCellText(cells[0]);
+                    const feeType     = getCellText(cells[1]);
+                    const amountRaw   = getCellText(cells[2]);
+                    const paymentMode = cells.length > 3 ? getCellText(cells[3]) : '';
+
+                    // Skip header-like or empty rows
+                    if (!sr || isNaN(parseInt(sr, 10))) continue;
+                    if (!feeType || feeType.includes('{{')) continue;
+
+                    // Parse numeric amount
+                    const amountNum = parseFloat(amountRaw.replace(/[^0-9.]/g, '')) || 0;
+                    totalPaid += amountNum;
+
+                    results.push({
+                        sr: parseInt(sr, 10),
+                        fee_type: feeType,
+                        amount: amountNum,
+                        amount_display: amountRaw,
+                        payment_mode: paymentMode,
+                    });
+                }
+
+                if (results.length > 0) break; // found the right table
+            }
+
+            return { fees: results, total_paid: totalPaid };
+        }
+        """)
+
+        fees["extracted_at"] = datetime.now().isoformat()
+        return fees
+
+    except Exception as e:
+        logger.error(f"extract_fees error: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+#  ATTENDANCE  ─  The page is Angular-rendered. Each row shows
+#  subject name, month-wise daily status cells (P/A/H/S), and
+#  totals. We wait for Angular, then use JS to extract cleanly.
+# ─────────────────────────────────────────────────────────────
 async def extract_attendance(page) -> dict:
-    """Parse attendance table into structured data."""
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("📋 Attendance")], wait_until="networkidle")
-        rows = await page.query_selector_all("table tr")
-        subjects = []
-        for row in rows[1:]:
-            cells = await row.query_selector_all("td")
-            if len(cells) >= 4:
-                texts = [await c.inner_text() for c in cells]
-                subjects.append({
-                    "subject": texts[0].strip(),
-                    "total":   texts[1].strip(),
-                    "present": texts[2].strip(),
-                    "percent": texts[3].strip(),
-                })
-        return {"subjects": subjects, "extracted_at": datetime.now().isoformat()}
+        await _wait_for_angular(page)
+        # Give extra time for data binding to settle
+        await asyncio.sleep(2)
+
+        data = await page.evaluate("""
+        () => {
+            const subjects = [];
+
+            // Find the main attendance table — look for one whose headers
+            // contain date-like numbers or day abbreviations
+            const tables = document.querySelectorAll('table');
+            let attTable = null;
+
+            for (const t of tables) {
+                const text = t.innerText;
+                if (text.includes('Present') || text.includes('Absent') ||
+                    text.includes('present') || text.includes('absent') ||
+                    text.includes('Total') && text.includes('Lect')) {
+                    attTable = t;
+                    break;
+                }
+            }
+
+            if (!attTable) {
+                // fallback: largest table on page
+                let maxCols = 0;
+                for (const t of tables) {
+                    const firstRow = t.querySelector('tr');
+                    if (firstRow) {
+                        const cols = firstRow.querySelectorAll('th,td').length;
+                        if (cols > maxCols) { maxCols = cols; attTable = t; }
+                    }
+                }
+            }
+
+            if (!attTable) return { subjects: [], headers: [] };
+
+            const allRows = Array.from(attTable.querySelectorAll('tr'));
+            if (allRows.length < 2) return { subjects: [], headers: [] };
+
+            // Extract header row to get date/day labels
+            const headerCells = Array.from(allRows[0].querySelectorAll('th, td'))
+                .map(c => c.innerText.trim().replace(/\\s+/g,' '));
+
+            for (const row of allRows.slice(1)) {
+                const cells = Array.from(row.querySelectorAll('td'));
+                if (cells.length < 4) continue;
+
+                const cellTexts = cells.map(c => c.innerText.trim().replace(/\\s+/g,' '));
+
+                // Skip legend rows (P=Present etc.) and rows with template literals
+                if (cellTexts.join('').includes('{{')) continue;
+                if (cellTexts[0].toLowerCase().includes('p - present')) continue;
+                if (cellTexts[0].toLowerCase().includes('h - holiday')) continue;
+
+                // Try to find numeric totals — usually last 3-4 cols: Total, Present, Absent, %
+                // We detect by looking for a cell with a number that looks like a percentage
+                let subjectName = cellTexts[0];
+                if (!subjectName || subjectName.match(/^\\d+$/)) continue;
+
+                // Find summary columns from the right
+                // Common pattern: [...daily cells...] Total | Present | Absent | %
+                let total = '', present = '', absent = '', percent = '';
+                const numericCells = [];
+                for (let i = cellTexts.length - 1; i >= 1; i--) {
+                    const v = cellTexts[i].replace(/[^0-9.]/g, '');
+                    if (v && !isNaN(parseFloat(v))) numericCells.unshift({ idx: i, val: cellTexts[i] });
+                    if (numericCells.length >= 4) break;
+                }
+
+                if (numericCells.length >= 3) {
+                    // Rightmost numeric columns assumed to be: Total, Present, Absent [, %]
+                    const n = numericCells.length;
+                    total   = numericCells[n >= 4 ? n-4 : 0]?.val || '';
+                    present = numericCells[n >= 3 ? n-3 : 0]?.val || '';
+                    absent  = numericCells[n >= 2 ? n-2 : 0]?.val || '';
+                    percent = numericCells[n >= 1 ? n-1 : 0]?.val || '';
+                }
+
+                // Build daily attendance map (date/day → status)
+                const daily = {};
+                for (let i = 1; i < cells.length; i++) {
+                    const hdr = headerCells[i] || `Col${i}`;
+                    const val = cellTexts[i];
+                    // Only include single-char status codes
+                    if (['P','A','H','S','L','E'].includes(val)) {
+                        daily[hdr] = val;
+                    }
+                }
+
+                subjects.push({
+                    subject: subjectName,
+                    total: total,
+                    present: present,
+                    absent: absent,
+                    percent: percent,
+                    daily: daily,
+                });
+            }
+
+            return { subjects, headers: headerCells };
+        }
+        """)
+
+        data["extracted_at"] = datetime.now().isoformat()
+        return data
+
     except Exception as e:
+        logger.error(f"extract_attendance error: {e}")
         return {"error": str(e)}
+
 
 async def extract_profile(page) -> dict:
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("👤 Profile")], wait_until="networkidle")
-        data = {}
-        labels = await page.query_selector_all("td.label, th")
-        for label in labels:
-            text = (await label.inner_text()).strip()
-            if ":" in text:
-                k, _, v = text.partition(":")
-                data[k.strip()] = v.strip()
+        await _wait_for_angular(page)
+        data = await page.evaluate("""
+        () => {
+            const info = {};
+            // Label-value pairs: look for th/td pairs or label:value text
+            const rows = document.querySelectorAll('tr');
+            for (const row of rows) {
+                const cells = Array.from(row.querySelectorAll('th, td'));
+                if (cells.length === 2) {
+                    const k = cells[0].innerText.trim().replace(/:\\s*$/, '');
+                    const v = cells[1].innerText.trim();
+                    if (k && v && !k.includes('{{') && !v.includes('{{')) {
+                        info[k] = v;
+                    }
+                }
+            }
+            return info;
+        }
+        """)
         return {"profile": data, "extracted_at": datetime.now().isoformat()}
     except Exception as e:
         return {"error": str(e)}
 
-async def extract_fees(page) -> dict:
-    try:
-        await page.goto(PAGE_VALS[PAGE_KEYS.index("💰 Fees")], wait_until="networkidle")
-        rows = await page.query_selector_all("table tr")
-        fees = []
-        for row in rows[1:]:
-            cells = await row.query_selector_all("td")
-            if len(cells) >= 3:
-                texts = [await c.inner_text() for c in cells]
-                fees.append({
-                    "description": texts[0].strip(),
-                    "amount":      texts[1].strip() if len(texts) > 1 else "",
-                    "status":      texts[2].strip() if len(texts) > 2 else "",
-                })
-        return {"fees": fees, "extracted_at": datetime.now().isoformat()}
-    except Exception as e:
-        return {"error": str(e)}
 
 async def extract_exam(page) -> dict:
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("📝 Exam")], wait_until="networkidle")
-        rows = await page.query_selector_all("table tr")
-        results = []
-        for row in rows[1:]:
-            cells = await row.query_selector_all("td")
-            if len(cells) >= 3:
-                texts = [await c.inner_text() for c in cells]
-                results.append({
-                    "subject": texts[0].strip(),
-                    "marks":   texts[1].strip() if len(texts) > 1 else "",
-                    "grade":   texts[2].strip() if len(texts) > 2 else "",
-                })
+        await _wait_for_angular(page)
+
+        results = await page.evaluate("""
+        () => {
+            const results = [];
+            const tables = document.querySelectorAll('table');
+            for (const table of tables) {
+                const rows = Array.from(table.querySelectorAll('tr'));
+                if (rows.length < 2) continue;
+                const headers = Array.from(rows[0].querySelectorAll('th,td'))
+                    .map(c => c.innerText.trim().toLowerCase());
+                const looksLikeExam = headers.some(h =>
+                    h.includes('subject') || h.includes('mark') || h.includes('grade') || h.includes('result')
+                );
+                if (!looksLikeExam) continue;
+                for (const row of rows.slice(1)) {
+                    const cells = Array.from(row.querySelectorAll('td'));
+                    if (cells.length < 2) continue;
+                    const texts = cells.map(c => c.innerText.trim().replace(/\\s+/g,' '));
+                    if (texts.join('').includes('{{')) continue;
+                    if (!texts[0] || texts[0].match(/^\\d+$/) && texts.length < 3) continue;
+                    results.push({
+                        subject: texts[0],
+                        marks:   texts[1] || '',
+                        grade:   texts[2] || '',
+                        result:  texts[3] || '',
+                    });
+                }
+                if (results.length > 0) break;
+            }
+            return results;
+        }
+        """)
+
         return {"results": results, "extracted_at": datetime.now().isoformat()}
     except Exception as e:
         return {"error": str(e)}
 
-def format_attendance_message(data: dict) -> str:
-    if "error" in data:
-        return f"❌ Could not extract attendance: {data['error']}"
-    subjects = data.get("subjects", [])
-    if not subjects:
-        return "📋 No attendance data found."
-    lines = ["📋 *Attendance Summary*\n"]
-    for s in subjects:
-        pct = s.get("percent", "?")
-        try:
-            pct_val = float(re.sub(r"[^\d.]", "", pct))
-            emoji = "✅" if pct_val >= 75 else "⚠️" if pct_val >= 60 else "❌"
-        except Exception:
-            emoji = "📌"
-        lines.append(f"{emoji} *{s['subject']}*\n   {s['present']}/{s['total']} — {pct}")
-    return "\n".join(lines)
+
+# ─────────────────────────────────────────────────────────────
+#  FORMATTERS
+# ─────────────────────────────────────────────────────────────
 
 def format_fees_message(data: dict) -> str:
     if "error" in data:
         return f"❌ Could not extract fees: {data['error']}"
+
     fees = data.get("fees", [])
     if not fees:
-        return "💰 No fee data found."
-    lines = ["💰 *Fee Details*\n"]
+        return "💰 No fee records found."
+
+    # Group by fee type for a clean summary
+    grouped: dict = {}
     for f in fees:
-        status_emoji = "✅" if "paid" in f["status"].lower() else "❗"
-        lines.append(f"{status_emoji} {f['description']}: ₹{f['amount']} — {f['status']}")
+        ft = f.get("fee_type", "Other")
+        if ft not in grouped:
+            grouped[ft] = {"total": 0.0, "count": 0, "modes": set()}
+        grouped[ft]["total"]  += f.get("amount", 0)
+        grouped[ft]["count"]  += 1
+        mode = f.get("payment_mode", "")
+        if mode:
+            grouped[ft]["modes"].add(mode)
+
+    total_paid = data.get("total_paid", sum(f.get("amount", 0) for f in fees))
+
+    lines = [
+        "💰 *Fee Payment Summary*",
+        f"📅 As of: {datetime.now().strftime('%d %b %Y')}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for fee_type, info in grouped.items():
+        modes_str = ", ".join(sorted(info["modes"])) if info["modes"] else "—"
+        lines.append(
+            f"✅ *{fee_type}*\n"
+            f"   💵 ₹{info['total']:,.2f}  "
+            f"({'×'+str(info['count']) if info['count'] > 1 else '1 payment'})\n"
+            f"   🏦 Mode: {modes_str}"
+        )
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        f"💳 *Total Paid: ₹{total_paid:,.2f}*",
+        f"📊 *{len(fees)} transaction(s) on record*",
+    ]
+
     return "\n".join(lines)
+
+
+def format_fees_detail_message(data: dict) -> str:
+    """Full transaction-by-transaction breakdown."""
+    if "error" in data:
+        return f"❌ {data['error']}"
+    fees = data.get("fees", [])
+    if not fees:
+        return "No transactions found."
+
+    lines = ["📋 *All Fee Transactions*\n"]
+    for f in fees:
+        mode = f.get("payment_mode", "—")
+        lines.append(
+            f"*#{f['sr']}* {f['fee_type']}\n"
+            f"   ₹{f['amount']:,.2f}  •  {mode}"
+        )
+    total = data.get("total_paid", 0)
+    lines.append(f"\n💳 *Total: ₹{total:,.2f}*")
+    return "\n".join(lines)
+
+
+def format_attendance_message(data: dict) -> str:
+    if "error" in data:
+        return f"❌ Could not extract attendance: {data['error']}"
+
+    subjects = data.get("subjects", [])
+    if not subjects:
+        return (
+            "📋 *Attendance*\n\n"
+            "⚠️ Could not parse attendance data.\n"
+            "The page may still be loading — try tapping *📋 Attendance* in the menu for a screenshot."
+        )
+
+    lines = [
+        "📋 *Attendance Summary*",
+        f"📅 {datetime.now().strftime('%d %b %Y')}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    safe_subjects = []
+    for s in subjects:
+        pct_raw = s.get("percent", "")
+        try:
+            pct_val = float(re.sub(r"[^\d.]", "", pct_raw))
+        except Exception:
+            pct_val = None
+
+        if pct_val is None:
+            continue  # skip rows without a parseable percentage
+
+        safe_subjects.append((s, pct_val))
+
+    if not safe_subjects:
+        return "📋 Attendance data found but could not parse percentages. Please use the screenshot view."
+
+    # Sort by percentage ascending (worst first)
+    safe_subjects.sort(key=lambda x: x[1])
+
+    for s, pct_val in safe_subjects:
+        present = s.get("present", "?")
+        total   = s.get("total", "?")
+        absent  = s.get("absent", "")
+
+        if pct_val >= 85:
+            bar_emoji = "🟢"
+            status    = "Good"
+        elif pct_val >= 75:
+            bar_emoji = "🟡"
+            status    = "OK"
+        elif pct_val >= 60:
+            bar_emoji = "🟠"
+            status    = "⚠️ Low"
+        else:
+            bar_emoji = "🔴"
+            status    = "❌ Critical"
+
+        # Progress bar (10 blocks)
+        filled    = int(pct_val / 10)
+        bar       = "█" * filled + "░" * (10 - filled)
+
+        absent_str = f" | Absent: {absent}" if absent else ""
+        lines.append(
+            f"\n{bar_emoji} *{s['subject']}*\n"
+            f"   `{bar}` {pct_val:.1f}%\n"
+            f"   Present: {present}/{total}{absent_str} — {status}"
+        )
+
+    # Summary stats
+    percentages = [pct for _, pct in safe_subjects]
+    avg_pct = sum(percentages) / len(percentages)
+    low_count = sum(1 for p in percentages if p < 75)
+
+    lines += [
+        "\n━━━━━━━━━━━━━━━━━━━━━━",
+        f"📊 *Average: {avg_pct:.1f}%*",
+    ]
+    if low_count:
+        lines.append(f"⚠️ *{low_count} subject(s) below 75%*")
+    else:
+        lines.append("✅ All subjects above 75%")
+
+    return "\n".join(lines)
+
+
+def format_attendance_daily(data: dict) -> str:
+    """Show day-by-day attendance for each subject."""
+    subjects = data.get("subjects", [])
+    if not subjects:
+        return "No daily data available."
+
+    lines = ["📅 *Daily Attendance Log*\n"]
+    for s in subjects:
+        daily = s.get("daily", {})
+        if not daily:
+            continue
+        lines.append(f"📚 *{s['subject']}*")
+
+        # Map status to emoji
+        status_map = {"P": "✅", "A": "❌", "H": "🏖", "S": "⛔", "L": "📝", "E": "🎓"}
+        day_parts = []
+        for date_label, status in daily.items():
+            emoji = status_map.get(status, "❓")
+            day_parts.append(f"{date_label}:{emoji}")
+
+        # Display in rows of 7 (one week per line)
+        for i in range(0, len(day_parts), 7):
+            lines.append("  " + "  ".join(day_parts[i:i+7]))
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "✅P=Present  ❌A=Absent",
+        "🏖H=Holiday  ⛔S=Suspend",
+    ]
+    return "\n".join(lines)
+
 
 def format_exam_message(data: dict) -> str:
     if "error" in data:
@@ -363,9 +771,21 @@ def format_exam_message(data: dict) -> str:
     results = data.get("results", [])
     if not results:
         return "📝 No exam results found."
-    lines = ["📝 *Exam Results*\n"]
+
+    lines = [
+        "📝 *Exam Results*",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
     for r in results:
-        lines.append(f"📌 *{r['subject']}* — {r['marks']} ({r['grade']})")
+        grade  = r.get("grade", "")
+        marks  = r.get("marks", "")
+        result = r.get("result", "")
+        grade_emoji = {"A+": "🏆", "A": "🥇", "B": "🥈", "C": "🥉", "F": "❌", "PASS": "✅", "FAIL": "❌"}.get(
+            result.upper() or grade.upper(), "📌"
+        )
+        detail = " | ".join(filter(None, [marks, grade, result]))
+        lines.append(f"{grade_emoji} *{r['subject']}*\n   {detail}")
+
     return "\n".join(lines)
 
 # ================= AI ASSISTANT =================
@@ -729,7 +1149,11 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
 
     elif data == "smartdata":
         await callback.answer("Extracting data...")
-        loading = await callback.message.answer("⏳ Extracting all ERP data (attendance, fees, exams)...")
+        loading = await callback.message.answer(
+            "⏳ Extracting ERP data…\n"
+            "_(Attendance may take a few seconds to render)_",
+            parse_mode="Markdown"
+        )
         att  = await extract_attendance(page)
         fees = await extract_fees(page)
         exam = await extract_exam(page)
@@ -738,10 +1162,58 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
         save_snapshot(chat_id, "fees", fees)
         save_snapshot(chat_id, "exam", exam)
 
+        # Cache for daily/detail sub-views
+        session["cache"]["att"]  = att
+        session["cache"]["fees"] = fees
+        session["cache"]["exam"] = exam
+
         await loading.delete()
-        await callback.message.answer(format_attendance_message(att), parse_mode="Markdown")
-        await callback.message.answer(format_fees_message(fees), parse_mode="Markdown")
-        await callback.message.answer(format_exam_message(exam), parse_mode="Markdown", reply_markup=get_back_menu())
+        await callback.message.answer(
+            format_attendance_message(att),
+            parse_mode="Markdown",
+            reply_markup=get_attendance_menu()
+        )
+        await callback.message.answer(
+            format_fees_message(fees),
+            parse_mode="Markdown",
+            reply_markup=get_fees_menu()
+        )
+        await callback.message.answer(
+            format_exam_message(exam),
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
+
+    elif data == "att_daily":
+        # Show day-by-day breakdown from cache (or re-fetch)
+        await callback.answer("Loading daily log...")
+        att = session.get("cache", {}).get("att")
+        if not att:
+            loading = await callback.message.answer("⏳ Fetching attendance...")
+            att = await extract_attendance(page)
+            session.setdefault("cache", {})["att"] = att
+            await loading.delete()
+        daily_text = format_attendance_daily(att)
+        if len(daily_text) > 4000:
+            # Split into chunks if too long
+            for i in range(0, len(daily_text), 4000):
+                await callback.message.answer(daily_text[i:i+4000], parse_mode="Markdown")
+        else:
+            await callback.message.answer(daily_text, parse_mode="Markdown", reply_markup=get_back_menu())
+
+    elif data == "fees_detail":
+        await callback.answer("Loading transactions...")
+        fees = session.get("cache", {}).get("fees")
+        if not fees:
+            loading = await callback.message.answer("⏳ Fetching fees...")
+            fees = await extract_fees(page)
+            session.setdefault("cache", {})["fees"] = fees
+            await loading.delete()
+        await callback.message.answer(
+            format_fees_detail_message(fees),
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
 
     elif data == "ask_ai":
         await callback.answer("Ask anything!")
