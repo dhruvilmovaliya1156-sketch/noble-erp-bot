@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -301,85 +300,78 @@ async def _wait_for_angular(page, timeout: int = 10000):
 #            2=Amount, 3=Payment Mode) and skip duplicate rows.
 # ─────────────────────────────────────────────────────────────
 async def extract_fees(page) -> dict:
+    """
+    Extract fee data from the server-rendered ASP.NET GridView.
+    Each row has spans with IDs like:
+      grd_inst_fee_ctl02_lbl_fee_type   → Paid Amount
+      grd_inst_fee_ctl02_lbl_pay_type   → Pay Type
+      grd_inst_fee_ctl02_lbl_account_head → Account Head
+      grd_inst_fee_ctl02_lbl_pay_date   → Pay Date
+      grd_inst_fee_ctl02_lbl_receipt_no → Receipt No
+      grd_inst_fee_ctl02_lbl_status     → Status
+    Total is in: grd_inst_fee_ctl16_lblTotal
+    """
     try:
-        await page.goto(PAGE_VALS[PAGE_KEYS.index("💰 Fees")], wait_until="networkidle")
-        await _wait_for_angular(page)
+        await page.goto(PAGE_VALS[PAGE_KEYS.index("\U0001f4b0 Fees")], wait_until="networkidle")
+        await asyncio.sleep(1)
 
         fees = await page.evaluate("""
         () => {
             const results = [];
-            let totalPaid = 0;
 
-            // Try every table on the page; pick the one that looks like fees
-            const tables = document.querySelectorAll('table');
-            for (const table of tables) {
-                const rows = Array.from(table.querySelectorAll('tr'));
-                if (rows.length < 2) continue;
+            // Find the main fee grid by its known ID prefix
+            const table = document.querySelector('[id*="grd_inst_fee"]');
+            if (!table) return { fees: [], total_paid: 0, error: "Fee table not found" };
 
-                // Check header row to identify the correct table
-                const headerCells = Array.from(rows[0].querySelectorAll('th, td'))
-                                        .map(c => c.innerText.trim().toLowerCase());
-                const looksLikeFees = headerCells.some(h =>
-                    h.includes('fee') || h.includes('amount') || h.includes('sr')
-                );
-                if (!looksLikeFees) continue;
+            // Find all data rows (tr with class tabe_12)
+            const rows = Array.from(document.querySelectorAll('tr.tabe_12'));
 
-                for (const row of rows.slice(1)) {
-                    const cells = Array.from(row.querySelectorAll('td'));
-                    if (cells.length < 3) continue;
+            for (const row of rows) {
+                // Use the specific span IDs to get clean values
+                const getSpan = (suffix) => {
+                    // Find span whose id ends with the suffix inside this row
+                    const spans = row.querySelectorAll(`span[id*="${suffix}"]`);
+                    for (const s of spans) {
+                        const t = s.innerText.trim();
+                        if (t) return t;
+                    }
+                    return '';
+                };
 
-                    // Each cell may have nested elements; take only direct text
-                    const getCellText = (cell) => {
-                        // Grab first non-empty text node or innerText as fallback
-                        for (const node of cell.childNodes) {
-                            if (node.nodeType === Node.TEXT_NODE) {
-                                const t = node.textContent.trim();
-                                if (t) return t;
-                            }
-                        }
-                        // Fallback: first span/input value
-                        const spans = cell.querySelectorAll('span, label');
-                        for (const s of spans) {
-                            const t = s.innerText.trim();
-                            if (t && !t.includes('{{')) return t;
-                        }
-                        // Last resort: full innerText deduplicated
-                        const full = cell.innerText.trim();
-                        const parts = full.split('\\n').map(p => p.trim()).filter(Boolean);
-                        // Remove duplicates that appear consecutively
-                        const unique = [];
-                        for (const p of parts) {
-                            if (unique[unique.length - 1] !== p) unique.push(p);
-                        }
-                        return unique[0] || '';
-                    };
+                // Sr No is plain text in first td
+                const tds = row.querySelectorAll('td.item_pading');
+                const sr_td = tds[0];
+                const sr = sr_td ? sr_td.innerText.trim() : '';
+                if (!sr || isNaN(parseInt(sr))) continue;
 
-                    const sr          = getCellText(cells[0]);
-                    const feeType     = getCellText(cells[1]);
-                    const amountRaw   = getCellText(cells[2]);
-                    const paymentMode = cells.length > 3 ? getCellText(cells[3]) : '';
+                const amount_raw   = getSpan('lbl_fee_type');      // column label is misleading; this is "Paid Amount"
+                const pay_type     = getSpan('lbl_pay_type');
+                const account_head = getSpan('lbl_account_head');
+                const pay_date     = getSpan('lbl_pay_date');
+                const receipt_no   = getSpan('lbl_receipt_no');
+                const status       = getSpan('lbl_status');
 
-                    // Skip header-like or empty rows
-                    if (!sr || isNaN(parseInt(sr, 10))) continue;
-                    if (!feeType || feeType.includes('{{')) continue;
+                // Parse amount
+                const amount_num = parseFloat(amount_raw.replace(/[^0-9.]/g, '')) || 0;
 
-                    // Parse numeric amount
-                    const amountNum = parseFloat(amountRaw.replace(/[^0-9.]/g, '')) || 0;
-                    totalPaid += amountNum;
-
-                    results.push({
-                        sr: parseInt(sr, 10),
-                        fee_type: feeType,
-                        amount: amountNum,
-                        amount_display: amountRaw,
-                        payment_mode: paymentMode,
-                    });
-                }
-
-                if (results.length > 0) break; // found the right table
+                results.push({
+                    sr: parseInt(sr),
+                    amount_display: amount_raw,
+                    amount: amount_num,
+                    pay_type: pay_type,
+                    account_head: account_head,
+                    pay_date: pay_date,
+                    receipt_no: receipt_no,
+                    status: status,
+                });
             }
 
-            return { fees: results, total_paid: totalPaid };
+            // Get the grand total from the footer row
+            const totalEl = document.querySelector('[id*="lblTotal"]');
+            const total_raw = totalEl ? totalEl.innerText.trim() : '0';
+            const total_paid = parseFloat(total_raw.replace(/[^0-9.]/g, '')) || 0;
+
+            return { fees: results, total_paid };
         }
         """)
 
@@ -391,115 +383,131 @@ async def extract_fees(page) -> dict:
         return {"error": str(e)}
 
 
-# ─────────────────────────────────────────────────────────────
-#  ATTENDANCE  ─  The page is Angular-rendered. Each row shows
-#  subject name, month-wise daily status cells (P/A/H/S), and
-#  totals. We wait for Angular, then use JS to extract cleanly.
-# ─────────────────────────────────────────────────────────────
 async def extract_attendance(page) -> dict:
+    """
+    Extract attendance from two tables on the page:
+
+    1. Month-wise table (Angular rendered) — we call the API endpoint directly
+       POST /Student-cp/Form_Students_Lecture_Wise_Attendance.aspx/ListAttendanceStudent
+       Returns JSON with fields: month, total_arrange_lect, remaning,
+       total_lecture_for_stud, absent_lecture, present_lecture, persentage
+
+    2. Lecture-wise table (server-rendered) — already in the HTML:
+       - <th> headers: "01/02<br/>Sun" format
+       - <td class="divtooltip"> cells with P/A/H/S/R in a <div>
+       - <span class="tooltiptext"> with Faculty and Topic info
+    """
     try:
-        await page.goto(PAGE_VALS[PAGE_KEYS.index("📋 Attendance")], wait_until="networkidle")
-        await _wait_for_angular(page)
-        # Give extra time for data binding to settle
-        await asyncio.sleep(2)
+        await page.goto(PAGE_VALS[PAGE_KEYS.index("\U0001f4cb Attendance")], wait_until="networkidle")
+        await asyncio.sleep(1)
 
         data = await page.evaluate("""
-        () => {
-            const subjects = [];
-
-            // Find the main attendance table — look for one whose headers
-            // contain date-like numbers or day abbreviations
-            const tables = document.querySelectorAll('table');
-            let attTable = null;
-
-            for (const t of tables) {
-                const text = t.innerText;
-                if (text.includes('Present') || text.includes('Absent') ||
-                    text.includes('present') || text.includes('absent') ||
-                    text.includes('Total') && text.includes('Lect')) {
-                    attTable = t;
-                    break;
-                }
-            }
-
-            if (!attTable) {
-                // fallback: largest table on page
-                let maxCols = 0;
-                for (const t of tables) {
-                    const firstRow = t.querySelector('tr');
-                    if (firstRow) {
-                        const cols = firstRow.querySelectorAll('th,td').length;
-                        if (cols > maxCols) { maxCols = cols; attTable = t; }
+        async () => {
+            // ── 1. Month-wise data via Angular API ──────────────────────
+            let monthly = [];
+            try {
+                const resp = await fetch(
+                    '/academic/Student-cp/Form_Students_Lecture_Wise_Attendance.aspx/ListAttendanceStudent',
+                    {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: '{}'
                     }
+                );
+                const json = await resp.json();
+                // The response wraps data in .d as a JSON string
+                const arr = typeof json.d === 'string' ? JSON.parse(json.d) : json.d;
+                if (Array.isArray(arr)) {
+                    monthly = arr.map((c, i) => ({
+                        sr: i + 1,
+                        month: c.month || '',
+                        total_arranged: c.total_arrange_lect || 0,
+                        remaining: c.remaning || 0,
+                        total_lectures: c.total_lecture_for_stud || 0,
+                        absent: c.absent_lecture || 0,
+                        present: c.present_lecture || 0,
+                        percentage: c.persentage || 0,
+                    }));
                 }
+            } catch(e) {
+                monthly = [];
             }
 
-            if (!attTable) return { subjects: [], headers: [] };
+            // ── 2. Lecture-wise table (server-rendered) ─────────────────
+            const lectures = [];
 
-            const allRows = Array.from(attTable.querySelectorAll('tr'));
-            if (allRows.length < 2) return { subjects: [], headers: [] };
+            // Find the lecture-wise table — it's inside div#..._div_lec_att
+            const lecDiv = document.querySelector('[id*="div_lec_att"]');
+            if (!lecDiv) return { monthly, lectures, student: {} };
 
-            // Extract header row to get date/day labels
-            const headerCells = Array.from(allRows[0].querySelectorAll('th, td'))
-                .map(c => c.innerText.trim().replace(/\\s+/g,' '));
+            // The table is the first table inside lecDiv
+            const table = lecDiv.querySelector('table');
+            if (!table) return { monthly, lectures, student: {} };
 
-            for (const row of allRows.slice(1)) {
+            // Parse header row — each <th> has text like "01/02\nSun"
+            const headerThs = Array.from(table.querySelectorAll('th'));
+            const headers = headerThs.map(th => {
+                // innerText gives "01/02\nSun" → we want "01/02 Sun"
+                return th.innerText.trim().replace(/\s+/g, ' ');
+            });
+            // headers[0] is "#" (row number)
+
+            // Parse data rows
+            const rows = Array.from(table.querySelectorAll('tr')).slice(1); // skip header
+            for (const row of rows) {
                 const cells = Array.from(row.querySelectorAll('td'));
-                if (cells.length < 4) continue;
+                if (cells.length < 2) continue;
 
-                const cellTexts = cells.map(c => c.innerText.trim().replace(/\\s+/g,' '));
+                // First cell: lecture slot number (1,2,3...)
+                const slotNum = cells[0].innerText.trim();
+                if (!slotNum || isNaN(parseInt(slotNum))) continue;
 
-                // Skip legend rows (P=Present etc.) and rows with template literals
-                if (cellTexts.join('').includes('{{')) continue;
-                if (cellTexts[0].toLowerCase().includes('p - present')) continue;
-                if (cellTexts[0].toLowerCase().includes('h - holiday')) continue;
-
-                // Try to find numeric totals — usually last 3-4 cols: Total, Present, Absent, %
-                // We detect by looking for a cell with a number that looks like a percentage
-                let subjectName = cellTexts[0];
-                if (!subjectName || subjectName.match(/^\\d+$/)) continue;
-
-                // Find summary columns from the right
-                // Common pattern: [...daily cells...] Total | Present | Absent | %
-                let total = '', present = '', absent = '', percent = '';
-                const numericCells = [];
-                for (let i = cellTexts.length - 1; i >= 1; i--) {
-                    const v = cellTexts[i].replace(/[^0-9.]/g, '');
-                    if (v && !isNaN(parseFloat(v))) numericCells.unshift({ idx: i, val: cellTexts[i] });
-                    if (numericCells.length >= 4) break;
-                }
-
-                if (numericCells.length >= 3) {
-                    // Rightmost numeric columns assumed to be: Total, Present, Absent [, %]
-                    const n = numericCells.length;
-                    total   = numericCells[n >= 4 ? n-4 : 0]?.val || '';
-                    present = numericCells[n >= 3 ? n-3 : 0]?.val || '';
-                    absent  = numericCells[n >= 2 ? n-2 : 0]?.val || '';
-                    percent = numericCells[n >= 1 ? n-1 : 0]?.val || '';
-                }
-
-                // Build daily attendance map (date/day → status)
-                const daily = {};
+                const days = [];
                 for (let i = 1; i < cells.length; i++) {
-                    const hdr = headerCells[i] || `Col${i}`;
-                    const val = cellTexts[i];
-                    // Only include single-char status codes
-                    if (['P','A','H','S','L','E'].includes(val)) {
-                        daily[hdr] = val;
+                    const cell = cells[i];
+                    const header = headers[i] || '';
+
+                    // Get status from the colored div inside
+                    const statusDiv = cell.querySelector('div');
+                    const status = statusDiv ? statusDiv.innerText.trim() : (cell.innerText.trim() === '-' ? '-' : '');
+
+                    // Get tooltip (faculty + topic)
+                    const tooltip = cell.querySelector('.tooltiptext');
+                    let faculty = '', topic = '', reason = '';
+                    if (tooltip) {
+                        const html = tooltip.innerHTML;
+                        const facMatch = html.match(/Faculty:.*?<\/b>([^<]+)/);
+                        const topicMatch = html.match(/Topic:.*?<\/b>([^<]+)/);
+                        const reasonMatch = html.match(/Reason:.*?<\/b>([^<]*)/);
+                        faculty = facMatch ? facMatch[1].trim() : '';
+                        topic   = topicMatch ? topicMatch[1].trim() : '';
+                        reason  = reasonMatch ? reasonMatch[1].trim() : '';
                     }
+
+                    days.push({ date: header, status, faculty, topic, reason });
                 }
 
-                subjects.push({
-                    subject: subjectName,
-                    total: total,
-                    present: present,
-                    absent: absent,
-                    percent: percent,
-                    daily: daily,
-                });
+                lectures.push({ slot: parseInt(slotNum), days });
             }
 
-            return { subjects, headers: headerCells };
+            // ── 3. Student info from the form ───────────────────────────
+            const getText = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.innerText.trim() : '';
+            };
+            const student = {
+                name:       getText('ctl00_ContentPlaceHolder1_lbl_name'),
+                enrollment: getText('ctl00_ContentPlaceHolder1_lbl_enroll'),
+                college:    getText('ctl00_ContentPlaceHolder1_lbl_coll'),
+                department: getText('ctl00_ContentPlaceHolder1_lbl_dept'),
+                course:     getText('ctl00_ContentPlaceHolder1_lbl_course'),
+                semester:   getText('ctl00_ContentPlaceHolder1_lbl_sm'),
+                division:   getText('ctl00_ContentPlaceHolder1_lbl_div'),
+                batch:      getText('ctl00_ContentPlaceHolder1_lbl_batch'),
+                term:       getText('ctl00_ContentPlaceHolder1_lbl_term'),
+            };
+
+            return { monthly, lectures, student, headers };
         }
         """)
 
@@ -585,183 +593,201 @@ async def extract_exam(page) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 def format_fees_message(data: dict) -> str:
+    """Summary grouped by account head with totals."""
     if "error" in data:
-        return f"❌ Could not extract fees: {data['error']}"
+        return f"\u274c Could not extract fees: {data['error']}"
 
     fees = data.get("fees", [])
     if not fees:
-        return "💰 No fee records found."
+        return "\U0001f4b0 No fee records found."
 
-    # Group by fee type for a clean summary
+    # Group by account_head
     grouped: dict = {}
     for f in fees:
-        ft = f.get("fee_type", "Other")
-        if ft not in grouped:
-            grouped[ft] = {"total": 0.0, "count": 0, "modes": set()}
-        grouped[ft]["total"]  += f.get("amount", 0)
-        grouped[ft]["count"]  += 1
-        mode = f.get("payment_mode", "")
-        if mode:
-            grouped[ft]["modes"].add(mode)
+        head = f.get("account_head", "Other")
+        if head not in grouped:
+            grouped[head] = {"total": 0.0, "count": 0, "modes": set(), "dates": []}
+        grouped[head]["total"]  += f.get("amount", 0)
+        grouped[head]["count"]  += 1
+        m = f.get("pay_type", "")
+        if m: grouped[head]["modes"].add(m)
+        d = f.get("pay_date", "")
+        if d: grouped[head]["dates"].append(d)
 
-    total_paid = data.get("total_paid", sum(f.get("amount", 0) for f in fees))
-
+    total_paid = data.get("total_paid", 0)
     lines = [
-        "💰 *Fee Payment Summary*",
-        f"📅 As of: {datetime.now().strftime('%d %b %Y')}",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "\U0001f4b0 *Fee Payment Summary*",
+        f"\U0001f4c5 As of: {datetime.now().strftime('%d %b %Y')}",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
     ]
-
-    for fee_type, info in grouped.items():
-        modes_str = ", ".join(sorted(info["modes"])) if info["modes"] else "—"
+    for head, info in grouped.items():
+        modes_str = " & ".join(sorted(info["modes"])) if info["modes"] else "—"
+        count_str = f"\u00d7{info['count']}" if info["count"] > 1 else "1 payment"
         lines.append(
-            f"✅ *{fee_type}*\n"
-            f"   💵 ₹{info['total']:,.2f}  "
-            f"({'×'+str(info['count']) if info['count'] > 1 else '1 payment'})\n"
-            f"   🏦 Mode: {modes_str}"
+            f"\u2705 *{head}*\n"
+            f"   \U0001f4b5 \u20b9{info['total']:,.2f} ({count_str})\n"
+            f"   \U0001f3e6 {modes_str}"
         )
-
     lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        f"💳 *Total Paid: ₹{total_paid:,.2f}*",
-        f"📊 *{len(fees)} transaction(s) on record*",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"\U0001f4b3 *Total Paid: \u20b9{total_paid:,.2f}*",
+        f"\U0001f4ca *{len(fees)} transaction(s)*",
     ]
-
     return "\n".join(lines)
 
 
 def format_fees_detail_message(data: dict) -> str:
-    """Full transaction-by-transaction breakdown."""
+    """Full transaction list with date, receipt, status."""
     if "error" in data:
-        return f"❌ {data['error']}"
+        return f"\u274c {data['error']}"
     fees = data.get("fees", [])
     if not fees:
         return "No transactions found."
 
-    lines = ["📋 *All Fee Transactions*\n"]
+    lines = ["\U0001f4cb *All Fee Transactions*\n"]
     for f in fees:
-        mode = f.get("payment_mode", "—")
+        status_icon = "\u2705" if "success" in f.get("status", "").lower() else "\u23f3"
         lines.append(
-            f"*#{f['sr']}* {f['fee_type']}\n"
-            f"   ₹{f['amount']:,.2f}  •  {mode}"
+            f"{status_icon} *#{f['sr']} — {f['account_head']}*\n"
+            f"   \u20b9{f['amount']:,.2f}  \u2022  {f['pay_type']}\n"
+            f"   \U0001f4c5 {f['pay_date']}  \u2022  Receipt: {f['receipt_no']}"
         )
     total = data.get("total_paid", 0)
-    lines.append(f"\n💳 *Total: ₹{total:,.2f}*")
+    lines.append(f"\n\U0001f4b3 *Total: \u20b9{total:,.2f}*")
     return "\n".join(lines)
 
 
 def format_attendance_message(data: dict) -> str:
+    """
+    Format month-wise attendance summary from the Angular API data.
+    Shows each month with percentage bar and present/absent counts.
+    """
     if "error" in data:
-        return f"❌ Could not extract attendance: {data['error']}"
+        return f"\u274c Could not extract attendance: {data['error']}"
 
-    subjects = data.get("subjects", [])
-    if not subjects:
+    monthly = data.get("monthly", [])
+    student = data.get("student", {})
+
+    if not monthly:
         return (
-            "📋 *Attendance*\n\n"
-            "⚠️ Could not parse attendance data.\n"
-            "The page may still be loading — try tapping *📋 Attendance* in the menu for a screenshot."
+            "\U0001f4cb *Attendance*\n\n"
+            "\u26a0\ufe0f No monthly data found.\n"
+            "Try tapping *\U0001f4cb Attendance* again after a moment."
         )
+
+    name = student.get("name", "")
+    course = student.get("course", "")
+    sem = student.get("semester", "")
+    term = student.get("term", "")
 
     lines = [
-        "📋 *Attendance Summary*",
-        f"📅 {datetime.now().strftime('%d %b %Y')}",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "\U0001f4cb *Month-wise Attendance*",
     ]
+    if name:
+        lines.append(f"\U0001f393 {name} | {course} {sem}")
+    if term:
+        lines.append(f"\U0001f4c5 Term: {term}")
+    lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
 
-    safe_subjects = []
-    for s in subjects:
-        pct_raw = s.get("percent", "")
+    all_pcts = []
+    for m in monthly:
         try:
-            pct_val = float(re.sub(r"[^\d.]", "", pct_raw))
+            pct = float(str(m.get("percentage", 0)).replace(",", "").strip())
         except Exception:
-            pct_val = None
+            pct = 0.0
 
-        if pct_val is None:
-            continue  # skip rows without a parseable percentage
+        all_pcts.append(pct)
 
-        safe_subjects.append((s, pct_val))
+        present = m.get("present", 0)
+        absent  = m.get("absent", 0)
+        total   = m.get("total_lectures", 0)
+        arranged = m.get("total_arranged", 0)
+        month_name = m.get("month", f"Month {m.get('sr','')}")
 
-    if not safe_subjects:
-        return "📋 Attendance data found but could not parse percentages. Please use the screenshot view."
+        if pct >= 85:   emoji, status = "\U0001f7e2", "Good"
+        elif pct >= 75: emoji, status = "\U0001f7e1", "OK"
+        elif pct >= 60: emoji, status = "\U0001f7e0", "\u26a0\ufe0f Low"
+        else:           emoji, status = "\U0001f534", "\u274c Critical"
 
-    # Sort by percentage ascending (worst first)
-    safe_subjects.sort(key=lambda x: x[1])
+        filled = int(pct / 10)
+        bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
-    for s, pct_val in safe_subjects:
-        present = s.get("present", "?")
-        total   = s.get("total", "?")
-        absent  = s.get("absent", "")
-
-        if pct_val >= 85:
-            bar_emoji = "🟢"
-            status    = "Good"
-        elif pct_val >= 75:
-            bar_emoji = "🟡"
-            status    = "OK"
-        elif pct_val >= 60:
-            bar_emoji = "🟠"
-            status    = "⚠️ Low"
-        else:
-            bar_emoji = "🔴"
-            status    = "❌ Critical"
-
-        # Progress bar (10 blocks)
-        filled    = int(pct_val / 10)
-        bar       = "█" * filled + "░" * (10 - filled)
-
-        absent_str = f" | Absent: {absent}" if absent else ""
         lines.append(
-            f"\n{bar_emoji} *{s['subject']}*\n"
-            f"   `{bar}` {pct_val:.1f}%\n"
-            f"   Present: {present}/{total}{absent_str} — {status}"
+            f"\n{emoji} *{month_name}*\n"
+            f"   `{bar}` {pct:.1f}%\n"
+            f"   \u2705 Present: {present}  \u274c Absent: {absent}  \U0001f4da Total: {total}\n"
+            f"   \U0001f4dd Arranged: {arranged}  — {status}"
         )
 
-    # Summary stats
-    percentages = [pct for _, pct in safe_subjects]
-    avg_pct = sum(percentages) / len(percentages)
-    low_count = sum(1 for p in percentages if p < 75)
-
-    lines += [
-        "\n━━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 *Average: {avg_pct:.1f}%*",
-    ]
-    if low_count:
-        lines.append(f"⚠️ *{low_count} subject(s) below 75%*")
-    else:
-        lines.append("✅ All subjects above 75%")
+    lines.append("\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
+    if all_pcts:
+        avg = sum(all_pcts) / len(all_pcts)
+        low = sum(1 for p in all_pcts if p < 75)
+        lines.append(f"\U0001f4ca *Overall Avg: {avg:.1f}%*")
+        if low:
+            lines.append(f"\u26a0\ufe0f *{low} month(s) below 75%*")
+        else:
+            lines.append("\u2705 All months above 75%")
 
     return "\n".join(lines)
 
 
 def format_attendance_daily(data: dict) -> str:
-    """Show day-by-day attendance for each subject."""
-    subjects = data.get("subjects", [])
-    if not subjects:
-        return "No daily data available."
+    """
+    Format lecture-wise (daily) attendance from server-rendered table.
+    Shows each lecture slot with date, status, faculty and topic.
+    """
+    lectures = data.get("lectures", [])
+    headers  = data.get("headers", [])
+    student  = data.get("student", {})
 
-    lines = ["📅 *Daily Attendance Log*\n"]
-    for s in subjects:
-        daily = s.get("daily", {})
-        if not daily:
-            continue
-        lines.append(f"📚 *{s['subject']}*")
+    if not lectures:
+        return "\U0001f4c5 No lecture-wise data available."
 
-        # Map status to emoji
-        status_map = {"P": "✅", "A": "❌", "H": "🏖", "S": "⛔", "L": "📝", "E": "🎓"}
+    name = student.get("name", "")
+    course = student.get("course", "")
+    sem = student.get("semester", "")
+
+    lines = [
+        "\U0001f4c5 *Lecture-wise Daily Attendance*",
+    ]
+    if name:
+        lines.append(f"\U0001f393 {name} | {course} {sem}")
+    lines.append("")
+
+    status_map = {
+        "P": "\u2705", "A": "\u274c", "H": "\U0001f3d6",
+        "S": "\u26d4", "L": "\U0001f4dd", "R": "\u23f3", "-": "\u2796"
+    }
+
+    for lec in lectures:
+        slot = lec.get("slot", "?")
+        days = lec.get("days", [])
+        lines.append(f"\U0001f4da *Lecture {slot}*")
+
+        present_count = sum(1 for d in days if d.get("status") == "P")
+        absent_count  = sum(1 for d in days if d.get("status") == "A")
+
+        # Show each day compactly: date status
         day_parts = []
-        for date_label, status in daily.items():
-            emoji = status_map.get(status, "❓")
-            day_parts.append(f"{date_label}:{emoji}")
+        for d in days:
+            st = d.get("status", "-")
+            date = d.get("date", "")
+            if st == "-": continue  # skip non-class days
+            em = status_map.get(st, "\u2753")
+            day_parts.append(f"`{date}`{em}")
 
-        # Display in rows of 7 (one week per line)
-        for i in range(0, len(day_parts), 7):
-            lines.append("  " + "  ".join(day_parts[i:i+7]))
+        # 4 per line
+        for i in range(0, len(day_parts), 4):
+            lines.append("  " + "  ".join(day_parts[i:i+4]))
+
+        lines.append(f"  \u2705{present_count} \u274c{absent_count}")
         lines.append("")
 
     lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "✅P=Present  ❌A=Absent",
-        "🏖H=Holiday  ⛔S=Suspend",
+        "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        "\u2705P=Present  \u274cA=Absent",
+        "\U0001f3d6H=Holiday  \u26d4S=Suspended  \u23f3R=Remaining",
     ]
     return "\n".join(lines)
 
