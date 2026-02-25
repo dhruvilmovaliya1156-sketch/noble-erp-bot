@@ -1135,12 +1135,80 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
     if data.startswith("page_"):
         idx = int(data.split("_")[1])
         page_name = PAGE_KEYS[idx]
-        page_url = PAGE_VALS[idx]
+        page_url  = PAGE_VALS[idx]
 
         await callback.answer(f"Loading {page_name}...")
-        await page.goto(page_url, wait_until="networkidle")
-        screenshot = await browser_manager.save_screenshot(page, "page")
-        await callback.message.answer_photo(FSInputFile(screenshot), caption=f"📸 {page_name}", reply_markup=get_back_menu())
+        loading = await callback.message.answer(f"⏳ Loading {page_name}...")
+
+        # ── Attendance ────────────────────────────────────────────
+        if page_name == "📋 Attendance":
+            att = await extract_attendance(page)   # navigates internally
+            save_snapshot(chat_id, "attendance", att)
+            session["cache"]["att"] = att
+
+            screenshot = await browser_manager.save_screenshot(page, "attendance")
+            await loading.delete()
+
+            # 1) Screenshot first so user can see the full page
+            await callback.message.answer_photo(
+                FSInputFile(screenshot),
+                caption="📸 Attendance Page"
+            )
+            # 2) Parsed summary right after
+            await callback.message.answer(
+                format_attendance_message(att),
+                parse_mode="Markdown",
+                reply_markup=get_attendance_menu()
+            )
+
+        # ── Fees ──────────────────────────────────────────────────
+        elif page_name == "💰 Fees":
+            fees = await extract_fees(page)
+            save_snapshot(chat_id, "fees", fees)
+            session["cache"]["fees"] = fees
+
+            screenshot = await browser_manager.save_screenshot(page, "fees")
+            await loading.delete()
+
+            await callback.message.answer_photo(
+                FSInputFile(screenshot),
+                caption="📸 Fee Details Page"
+            )
+            await callback.message.answer(
+                format_fees_message(fees),
+                parse_mode="Markdown",
+                reply_markup=get_fees_menu()
+            )
+
+        # ── Exam ──────────────────────────────────────────────────
+        elif page_name == "📝 Exam":
+            exam = await extract_exam(page)
+            save_snapshot(chat_id, "exam", exam)
+            session["cache"]["exam"] = exam
+
+            screenshot = await browser_manager.save_screenshot(page, "exam")
+            await loading.delete()
+
+            await callback.message.answer_photo(
+                FSInputFile(screenshot),
+                caption="📸 Exam Results Page"
+            )
+            await callback.message.answer(
+                format_exam_message(exam),
+                parse_mode="Markdown",
+                reply_markup=get_back_menu()
+            )
+
+        # ── All other pages → screenshot only ────────────────────
+        else:
+            await page.goto(page_url, wait_until="networkidle")
+            screenshot = await browser_manager.save_screenshot(page, "page")
+            await loading.delete()
+            await callback.message.answer_photo(
+                FSInputFile(screenshot),
+                caption=f"📸 {page_name}",
+                reply_markup=get_back_menu()
+            )
 
     elif data == "screenshot":
         await callback.answer("Taking screenshot...")
