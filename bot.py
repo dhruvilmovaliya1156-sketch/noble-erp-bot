@@ -221,6 +221,7 @@ def get_menu():
         InlineKeyboardButton(text="🤖 Ask AI",      callback_data="ask_ai"),
     ])
     rows.append([
+        InlineKeyboardButton(text="🏅 My Result",     callback_data="view_result"),
         InlineKeyboardButton(text="🔔 Toggle Alerts", callback_data="toggle_alerts"),
         InlineKeyboardButton(text="🚪 Logout",         callback_data="logout"),
     ])
@@ -293,6 +294,172 @@ async def _wait_for_angular(page, timeout: int = 10000):
     except Exception:
         pass  # proceed anyway; we'll filter junk rows ourselves
 
+
+# ─────────────────────────────────────────────────────────────
+#  PROFILE  ─  Extract from ASP.NET label elements directly
+# ─────────────────────────────────────────────────────────────
+async def extract_profile(page) -> dict:
+    """
+    Extract full student profile from the ASP.NET profile page.
+    Uses specific label IDs known from the page source.
+    """
+    try:
+        await page.goto(PAGE_VALS[PAGE_KEYS.index("👤 Profile")], wait_until="networkidle")
+        await asyncio.sleep(1)
+        await _wait_for_angular(page)
+
+        profile = await page.evaluate("""
+        () => {
+            const g = (id) => {
+                const el = document.getElementById(id);
+                return el ? el.innerText.trim() : '';
+            };
+
+            return {
+                // Personal
+                full_name:        g('ctl00_ContentPlaceHolder1_lbl_name'),
+                marksheet_name:   g('ctl00_ContentPlaceHolder1_lbl_as_per_marksheet_name'),
+                father_name:      g('ctl00_ContentPlaceHolder1_lbl_fathername'),
+                mother_name:      g('ctl00_ContentPlaceHolder1_lbl_mothername'),
+                gender:           g('ctl00_ContentPlaceHolder1_lbl_gen'),
+                dob:              g('ctl00_ContentPlaceHolder1_lbl_dob'),
+                aadhar:           g('ctl00_ContentPlaceHolder1_lbl_adhar'),
+                blood_group:      g('ctl00_ContentPlaceHolder1_lbl_blood'),
+                email:            g('ctl00_ContentPlaceHolder1_lbl_email'),
+                mobile:           g('ctl00_ContentPlaceHolder1_lbl_mob_no'),
+                category:         g('ctl00_ContentPlaceHolder1_lbl_category'),
+                // Academic
+                college:          g('ctl00_ContentPlaceHolder1_lbl_col'),
+                department:       g('ctl00_ContentPlaceHolder1_lbl_batch'),
+                program:          g('ctl00_ContentPlaceHolder1_lbl_course'),
+                semester:         g('ctl00_ContentPlaceHolder1_lbl_sem'),
+                division:         g('ctl00_ContentPlaceHolder1_lbl_division'),
+                roll_no:          g('ctl00_ContentPlaceHolder1_lbl_rollno'),
+                admission_no:     g('ctl00_ContentPlaceHolder1_lbl_adm_no'),
+                enrollment_no:    g('ctl00_ContentPlaceHolder1_lbl_enroll'),
+                admission_year:   g('ctl00_ContentPlaceHolder1_lbl_adm_yr'),
+                admission_type:   g('ctl00_ContentPlaceHolder1_lbl_adm_type'),
+                abc_id:           g('ctl00_ContentPlaceHolder1_lbl_abc_id'),
+                // Contact
+                address:          g('ctl00_ContentPlaceHolder1_lbl_add'),
+                address2:         g('ctl00_ContentPlaceHolder1_lbl_add1'),
+                city:             g('ctl00_ContentPlaceHolder1_lbl_city'),
+                state:            g('ctl00_ContentPlaceHolder1_lbl_state'),
+                pincode:          g('ctl00_ContentPlaceHolder1_lbl_pincode'),
+                father_mobile:    g('ctl00_ContentPlaceHolder1_lbl_father_no'),
+            };
+        }
+        """)
+
+        profile["extracted_at"] = datetime.now().isoformat()
+        return {"profile": profile, "extracted_at": profile["extracted_at"]}
+    except Exception as e:
+        logger.error(f"extract_profile error: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────
+#  RESULT  ─  Call Angular API endpoint like the page does
+# ─────────────────────────────────────────────────────────────
+async def extract_result(page) -> dict:
+    """
+    Extract exam results by calling the Angular/ASP.NET API endpoint
+    that the Student_Result.aspx page uses internally.
+    """
+    try:
+        # Navigate to result page first to establish session cookies
+        await page.goto(
+            "https://noble.icrp.in/academic/Student-cp/Student_Result.aspx",
+            wait_until="networkidle"
+        )
+        await asyncio.sleep(1)
+
+        # Grab cookies for authenticated API call
+        import aiohttp as _aiohttp
+        cookies_list = await page.context.cookies()
+        cookie_jar = {c["name"]: c["value"] for c in cookies_list}
+
+        results = []
+        backlog_data = []
+
+        # 1. Get list of exam results
+        api_url = "https://noble.icrp.in/academic/Student-cp/Student_Result.aspx/ListStudentResult"
+        async with _aiohttp.ClientSession(cookies=cookie_jar) as sess:
+            async with sess.post(
+                api_url,
+                json={"filter_mode": 0},
+                headers={
+                    "Content-Type": "application/json",
+                    "Referer": "https://noble.icrp.in/academic/Student-cp/Student_Result.aspx",
+                },
+                timeout=_aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.json(content_type=None)
+                d = raw.get("d", [])
+                if isinstance(d, str):
+                    d = json.loads(d)
+                if isinstance(d, list):
+                    for item in d:
+                        results.append({
+                            "enrollment":        item.get("Student_Code", ""),
+                            "name":              item.get("Student_Name", ""),
+                            "program":           item.get("Degree_Name", ""),
+                            "semester":          item.get("Semester_Name", ""),
+                            "exam":              item.get("exam_name", ""),
+                            "exam_type":         item.get("student_exam_type", ""),
+                            "result_declared":   item.get("is_result_declare", 0),
+                            "swd_sem_id":        item.get("swd_sem_id"),
+                            "swd_term_id":       item.get("swd_term_id"),
+                            "swd_year_id":       item.get("swd_year_id"),
+                            "swd_id":            item.get("swd_id"),
+                            "swd_college_id":    item.get("swd_college_id"),
+                            "degree_id":         item.get("Degree_id"),
+                            "student_id":        item.get("Student_Id"),
+                        })
+
+        # 2. Get consolidated performance / SGPA / backlogs
+        backlog_url = "https://noble.icrp.in/academic/Student-cp/Student_Result.aspx/Get_student_total_backlog_and_attempt"
+        async with _aiohttp.ClientSession(cookies=cookie_jar) as sess:
+            async with sess.post(
+                backlog_url,
+                json={},
+                headers={
+                    "Content-Type": "application/json",
+                    "Referer": "https://noble.icrp.in/academic/Student-cp/Student_Result.aspx",
+                },
+                timeout=_aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.json(content_type=None)
+                d = raw.get("d", [])
+                if isinstance(d, str):
+                    d = json.loads(d)
+                if isinstance(d, list):
+                    for item in d:
+                        try:
+                            sgpa = float(str(item.get("ssrd_SGPA", 0)).replace(",", "").strip())
+                        except Exception:
+                            sgpa = 0.0
+                        backlog_data.append({
+                            "semester":      item.get("semester_name", ""),
+                            "sgpa":          sgpa,
+                            "backlogs":      item.get("Total_backlog", 0),
+                            "attempts":      item.get("Total_Attempt", 0),
+                            "enrollment_no": item.get("enrollment_no", ""),
+                            "student_name":  item.get("student_name", ""),
+                            "degree_name":   item.get("Degree_Name", ""),
+                        })
+
+        return {
+            "results":  results,
+            "performance": backlog_data,
+            "extracted_at": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"extract_result error: {e}")
+        return {"error": str(e)}
+
+
 # ─────────────────────────────────────────────────────────────
 #  FEES  ─  The ERP table repeats cell text across columns due
 #            to nested <span> / Angular bindings. We use JS to
@@ -300,17 +467,6 @@ async def _wait_for_angular(page, timeout: int = 10000):
 #            2=Amount, 3=Payment Mode) and skip duplicate rows.
 # ─────────────────────────────────────────────────────────────
 async def extract_fees(page) -> dict:
-    """
-    Extract fee data from the server-rendered ASP.NET GridView.
-    Each row has spans with IDs like:
-      grd_inst_fee_ctl02_lbl_fee_type   → Paid Amount
-      grd_inst_fee_ctl02_lbl_pay_type   → Pay Type
-      grd_inst_fee_ctl02_lbl_account_head → Account Head
-      grd_inst_fee_ctl02_lbl_pay_date   → Pay Date
-      grd_inst_fee_ctl02_lbl_receipt_no → Receipt No
-      grd_inst_fee_ctl02_lbl_status     → Status
-    Total is in: grd_inst_fee_ctl16_lblTotal
-    """
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("\U0001f4b0 Fees")], wait_until="networkidle")
         await asyncio.sleep(1)
@@ -318,18 +474,12 @@ async def extract_fees(page) -> dict:
         fees = await page.evaluate("""
         () => {
             const results = [];
-
-            // Find the main fee grid by its known ID prefix
             const table = document.querySelector('[id*="grd_inst_fee"]');
             if (!table) return { fees: [], total_paid: 0, error: "Fee table not found" };
 
-            // Find all data rows (tr with class tabe_12)
             const rows = Array.from(document.querySelectorAll('tr.tabe_12'));
-
             for (const row of rows) {
-                // Use the specific span IDs to get clean values
                 const getSpan = (suffix) => {
-                    // Find span whose id ends with the suffix inside this row
                     const spans = row.querySelectorAll(`span[id*="${suffix}"]`);
                     for (const s of spans) {
                         const t = s.innerText.trim();
@@ -338,39 +488,34 @@ async def extract_fees(page) -> dict:
                     return '';
                 };
 
-                // Sr No is plain text in first td
                 const tds = row.querySelectorAll('td.item_pading');
                 const sr_td = tds[0];
                 const sr = sr_td ? sr_td.innerText.trim() : '';
                 if (!sr || isNaN(parseInt(sr))) continue;
 
-                const amount_raw   = getSpan('lbl_fee_type');      // column label is misleading; this is "Paid Amount"
+                const amount_raw   = getSpan('lbl_fee_type');
                 const pay_type     = getSpan('lbl_pay_type');
                 const account_head = getSpan('lbl_account_head');
                 const pay_date     = getSpan('lbl_pay_date');
                 const receipt_no   = getSpan('lbl_receipt_no');
                 const status       = getSpan('lbl_status');
-
-                // Parse amount
-                const amount_num = parseFloat(amount_raw.replace(/[^0-9.]/g, '')) || 0;
+                const amount_num   = parseFloat(amount_raw.replace(/[^0-9.]/g, '')) || 0;
 
                 results.push({
                     sr: parseInt(sr),
                     amount_display: amount_raw,
                     amount: amount_num,
-                    pay_type: pay_type,
-                    account_head: account_head,
-                    pay_date: pay_date,
-                    receipt_no: receipt_no,
-                    status: status,
+                    pay_type,
+                    account_head,
+                    pay_date,
+                    receipt_no,
+                    status,
                 });
             }
 
-            // Get the grand total from the footer row
             const totalEl = document.querySelector('[id*="lblTotal"]');
             const total_raw = totalEl ? totalEl.innerText.trim() : '0';
             const total_paid = parseFloat(total_raw.replace(/[^0-9.]/g, '')) || 0;
-
             return { fees: results, total_paid };
         }
         """)
@@ -384,25 +529,13 @@ async def extract_fees(page) -> dict:
 
 
 async def extract_attendance(page) -> dict:
-    """
-    Extract attendance from two sources:
-
-    1. Month-wise: POST to the Angular API endpoint using aiohttp
-       (cookies from the browser session are copied so auth works)
-
-    2. Lecture-wise: synchronous page.evaluate() on the already server-rendered
-       table inside div[id*=div_lec_att]
-    """
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("📋 Attendance")], wait_until="networkidle")
         await asyncio.sleep(1)
 
-        # ── 1. Month-wise via Python aiohttp (avoids async in evaluate) ─
         monthly = []
         try:
             import aiohttp as _aiohttp
-
-            # Grab cookies from the Playwright page so the request is authenticated
             cookies_list = await page.context.cookies()
             cookie_jar = {c["name"]: c["value"] for c in cookies_list}
 
@@ -418,7 +551,6 @@ async def extract_attendance(page) -> dict:
                     timeout=_aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     raw = await resp.json(content_type=None)
-                    # Response wraps data in .d which may be a JSON string
                     d = raw.get("d", [])
                     if isinstance(d, str):
                         d = json.loads(d)
@@ -438,9 +570,6 @@ async def extract_attendance(page) -> dict:
             logger.warning(f"Monthly API call failed: {e}")
             monthly = []
 
-        # ── 2. Lecture-wise DOM scraping ─────────────────────────────────
-        # NOTE: JS is built as a Python string to avoid quote-escaping issues
-        # with the str_replace tool mangling single quotes inside triple-quotes.
         _js_att = (
             "() => {"
             "  const lectures = [];"
@@ -508,33 +637,6 @@ async def extract_attendance(page) -> dict:
         return {"error": str(e)}
 
 
-async def extract_profile(page) -> dict:
-    try:
-        await page.goto(PAGE_VALS[PAGE_KEYS.index("👤 Profile")], wait_until="networkidle")
-        await _wait_for_angular(page)
-        data = await page.evaluate("""
-        () => {
-            const info = {};
-            // Label-value pairs: look for th/td pairs or label:value text
-            const rows = document.querySelectorAll('tr');
-            for (const row of rows) {
-                const cells = Array.from(row.querySelectorAll('th, td'));
-                if (cells.length === 2) {
-                    const k = cells[0].innerText.trim().replace(/:\\s*$/, '');
-                    const v = cells[1].innerText.trim();
-                    if (k && v && !k.includes('{{') && !v.includes('{{')) {
-                        info[k] = v;
-                    }
-                }
-            }
-            return info;
-        }
-        """)
-        return {"profile": data, "extracted_at": datetime.now().isoformat()}
-    except Exception as e:
-        return {"error": str(e)}
-
-
 async def extract_exam(page) -> dict:
     try:
         await page.goto(PAGE_VALS[PAGE_KEYS.index("📝 Exam")], wait_until="networkidle")
@@ -581,6 +683,126 @@ async def extract_exam(page) -> dict:
 #  FORMATTERS
 # ─────────────────────────────────────────────────────────────
 
+def format_profile_message(data: dict) -> str:
+    """Format student profile into a clean Telegram message."""
+    if "error" in data:
+        return f"❌ Could not extract profile: {data['error']}"
+
+    p = data.get("profile", {})
+    if not p:
+        return "👤 No profile data found."
+
+    lines = [
+        "👤 *Student Profile*",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "📌 *Personal Details*",
+    ]
+
+    def row(label, value):
+        if value and value.strip():
+            lines.append(f"  `{label}:` {value}")
+
+    row("Full Name",     p.get("full_name", ""))
+    row("Father",        p.get("father_name", ""))
+    row("Mother",        p.get("mother_name", ""))
+    row("Gender",        p.get("gender", ""))
+    row("Date of Birth", p.get("dob", ""))
+    row("Blood Group",   p.get("blood_group", ""))
+    row("Category",      p.get("category", ""))
+    row("Aadhar",        p.get("aadhar", ""))
+    row("ABC / APAAR",   p.get("abc_id", ""))
+
+    lines += ["", "📞 *Contact*"]
+    row("Mobile",        p.get("mobile", ""))
+    row("Email",         p.get("email", ""))
+    row("Address",       p.get("address", ""))
+    row("City",          p.get("city", ""))
+    row("State",         p.get("state", ""))
+    row("Pin Code",      p.get("pincode", ""))
+    row("Father Mobile", p.get("father_mobile", ""))
+
+    lines += ["", "🎓 *Academic Details*"]
+    row("College/Faculty",  p.get("college", ""))
+    row("Department",       p.get("department", ""))
+    row("Program",          p.get("program", ""))
+    row("Semester",         p.get("semester", ""))
+    row("Division",         p.get("division", ""))
+    row("Roll No",          p.get("roll_no", ""))
+    row("Enrollment No",    p.get("enrollment_no", ""))
+    row("Admission No",     p.get("admission_no", ""))
+    row("Admission Year",   p.get("admission_year", ""))
+    row("Admission Type",   p.get("admission_type", ""))
+
+    lines += ["", f"🕐 _Updated: {datetime.now().strftime('%d %b %Y, %H:%M')}_"]
+    return "\n".join(lines)
+
+
+def format_result_message(data: dict) -> str:
+    """Format exam result list into Telegram message."""
+    if "error" in data:
+        return f"❌ Could not fetch results: {data['error']}"
+
+    results = data.get("results", [])
+    performance = data.get("performance", [])
+
+    if not results and not performance:
+        return "🏅 No result data found."
+
+    lines = ["🏅 *Exam Results*", "━━━━━━━━━━━━━━━━━━━━━━"]
+
+    # Show semester-wise results list
+    if results:
+        lines.append("")
+        lines.append("📋 *Registered Exams*")
+        for r in results:
+            declared = r.get("result_declared", 0)
+            status_icon = "✅" if declared else "⏳"
+            lines.append(
+                f"\n{status_icon} *{r.get('semester', 'N/A')}* — {r.get('exam', 'N/A')}\n"
+                f"   📚 {r.get('program', '')}\n"
+                f"   🔖 Type: {r.get('exam_type', 'N/A')}\n"
+                f"   {'🟢 Result Declared' if declared else '🔴 Result Not Declared Yet'}"
+            )
+
+    # Show SGPA / consolidated performance
+    if performance:
+        lines += ["", "━━━━━━━━━━━━━━━━━━━━━━", "📊 *Consolidated Performance*", ""]
+
+        total_backlogs = 0
+        for p in performance:
+            sgpa = p.get("sgpa", 0)
+            backlogs = p.get("backlogs", 0)
+            total_backlogs += int(backlogs) if str(backlogs).isdigit() else 0
+
+            if sgpa >= 9.0:
+                grade_emoji = "🏆"
+            elif sgpa >= 8.0:
+                grade_emoji = "🥇"
+            elif sgpa >= 7.0:
+                grade_emoji = "🥈"
+            elif sgpa >= 6.0:
+                grade_emoji = "🥉"
+            elif sgpa > 0:
+                grade_emoji = "📌"
+            else:
+                grade_emoji = "⏳"
+
+            lines.append(
+                f"{grade_emoji} *{p.get('semester', 'N/A')}*\n"
+                f"   SGPA: `{sgpa:.2f}` | Backlogs: `{backlogs}` | Attempts: `{p.get('attempts', 0)}`"
+            )
+
+        lines += [
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📌 *Total Backlogs: {total_backlogs}*",
+        ]
+
+    lines.append(f"\n🕐 _Updated: {datetime.now().strftime('%d %b %Y, %H:%M')}_")
+    return "\n".join(lines)
+
+
 def format_fees_message(data: dict) -> str:
     """Summary grouped by account head with totals."""
     if "error" in data:
@@ -590,7 +812,6 @@ def format_fees_message(data: dict) -> str:
     if not fees:
         return "\U0001f4b0 No fee records found."
 
-    # Group by account_head
     grouped: dict = {}
     for f in fees:
         head = f.get("account_head", "Other")
@@ -626,7 +847,6 @@ def format_fees_message(data: dict) -> str:
 
 
 def format_fees_detail_message(data: dict) -> str:
-    """Full transaction list with date, receipt, status."""
     if "error" in data:
         return f"\u274c {data['error']}"
     fees = data.get("fees", [])
@@ -647,10 +867,6 @@ def format_fees_detail_message(data: dict) -> str:
 
 
 def format_attendance_message(data: dict) -> str:
-    """
-    Format month-wise attendance summary from the Angular API data.
-    Shows each month with percentage bar and present/absent counts.
-    """
     if "error" in data:
         return f"\u274c Could not extract attendance: {data['error']}"
 
@@ -669,9 +885,7 @@ def format_attendance_message(data: dict) -> str:
     sem = student.get("semester", "")
     term = student.get("term", "")
 
-    lines = [
-        "\U0001f4cb *Month-wise Attendance*",
-    ]
+    lines = ["\U0001f4cb *Month-wise Attendance*"]
     if name:
         lines.append(f"\U0001f393 {name} | {course} {sem}")
     if term:
@@ -686,7 +900,6 @@ def format_attendance_message(data: dict) -> str:
             pct = 0.0
 
         all_pcts.append(pct)
-
         present = m.get("present", 0)
         absent  = m.get("absent", 0)
         total   = m.get("total_lectures", 0)
@@ -722,10 +935,6 @@ def format_attendance_message(data: dict) -> str:
 
 
 def format_attendance_daily(data: dict) -> str:
-    """
-    Format lecture-wise (daily) attendance from server-rendered table.
-    Shows each lecture slot with date, status, faculty and topic.
-    """
     lectures = data.get("lectures", [])
     headers  = data.get("headers", [])
     student  = data.get("student", {})
@@ -737,9 +946,7 @@ def format_attendance_daily(data: dict) -> str:
     course = student.get("course", "")
     sem = student.get("semester", "")
 
-    lines = [
-        "\U0001f4c5 *Lecture-wise Daily Attendance*",
-    ]
+    lines = ["\U0001f4c5 *Lecture-wise Daily Attendance*"]
     if name:
         lines.append(f"\U0001f393 {name} | {course} {sem}")
     lines.append("")
@@ -757,16 +964,14 @@ def format_attendance_daily(data: dict) -> str:
         present_count = sum(1 for d in days if d.get("status") == "P")
         absent_count  = sum(1 for d in days if d.get("status") == "A")
 
-        # Show each day compactly: date status
         day_parts = []
         for d in days:
             st = d.get("status", "-")
             date = d.get("date", "")
-            if st == "-": continue  # skip non-class days
+            if st == "-": continue
             em = status_map.get(st, "\u2753")
             day_parts.append(f"`{date}`{em}")
 
-        # 4 per line
         for i in range(0, len(day_parts), 4):
             lines.append("  " + "  ".join(day_parts[i:i+4]))
 
@@ -807,7 +1012,6 @@ def format_exam_message(data: dict) -> str:
 # ================= AI ASSISTANT =================
 
 async def ask_erp_ai(question: str, context_data: dict) -> str:
-    """Use OpenAI to answer questions about extracted ERP data."""
     if not OPENAI_API_KEY:
         return "🤖 AI assistant not configured. Set OPENAI_API_KEY in .env to enable this feature."
 
@@ -839,7 +1043,6 @@ Answer this question concisely and helpfully:
 # ================= AUTO-LOGIN HELPER =================
 
 async def auto_login(chat_id: int) -> Optional[dict]:
-    """Restore session using saved credentials."""
     creds = get_credentials(chat_id)
     if not creds:
         return None
@@ -878,7 +1081,6 @@ async def auto_login(chat_id: int) -> Optional[dict]:
 # ================= SCHEDULED ALERTS =================
 
 async def run_scheduled_alerts():
-    """Background task: check attendance daily and alert if low."""
     while True:
         await asyncio.sleep(ALERT_CHECK_INTERVAL)
         logger.info("Running scheduled alert check...")
@@ -895,7 +1097,6 @@ async def run_scheduled_alerts():
                 att_data = await extract_attendance(page)
                 save_snapshot(chat_id, "attendance", att_data)
 
-                # Find low attendance subjects
                 low = []
                 for s in att_data.get("subjects", []):
                     try:
@@ -989,6 +1190,41 @@ async def cmd_exam(message: Message):
     save_snapshot(chat_id, "exam", exam)
     await msg.edit_text(format_exam_message(exam), parse_mode="Markdown")
 
+@dp.message(Command("profile"))
+async def cmd_profile(message: Message):
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id)
+    if not session or is_expired(session):
+        session = await auto_login(chat_id)
+    if not session:
+        await message.answer("❌ Not logged in. Use /start")
+        return
+    msg = await message.answer("⏳ Fetching your profile...")
+    profile_data = await extract_profile(session["page"])
+    save_snapshot(chat_id, "profile", profile_data)
+    session.setdefault("cache", {})["profile"] = profile_data
+    await msg.edit_text(format_profile_message(profile_data), parse_mode="Markdown", reply_markup=get_back_menu())
+
+@dp.message(Command("result"))
+async def cmd_result(message: Message):
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id)
+    if not session or is_expired(session):
+        session = await auto_login(chat_id)
+    if not session:
+        await message.answer("❌ Not logged in. Use /start")
+        return
+    msg = await message.answer("⏳ Fetching your results...")
+    result_data = await extract_result(session["page"])
+    save_snapshot(chat_id, "result", result_data)
+    session.setdefault("cache", {})["result"] = result_data
+    text = format_result_message(result_data)
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.answer(text[i:i+4000], parse_mode="Markdown")
+    else:
+        await msg.edit_text(text, parse_mode="Markdown", reply_markup=get_back_menu())
+
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     chat_id = message.chat.id
@@ -1034,7 +1270,6 @@ async def get_password(message: Message, state: FSMContext):
     password = message.text.strip()
     await state.clear()
 
-    # Delete password message for security
     try:
         await message.delete()
     except Exception:
@@ -1064,7 +1299,6 @@ async def get_password(message: Message, state: FSMContext):
         except Exception:
             pass
 
-        # Save credentials for auto-login
         save_credentials(message.chat.id, username, password)
 
         user_sessions[message.chat.id] = {
@@ -1076,7 +1310,8 @@ async def get_password(message: Message, state: FSMContext):
 
         await msg.delete()
         await message.answer(
-            "✅ *Login Successful!*\n\nTip: Use /attendance, /fees, /exam for quick data, or the menu below.",
+            "✅ *Login Successful!*\n\n"
+            "Tip: Use /profile, /result, /attendance, /fees for quick data, or the menu below.",
             parse_mode="Markdown",
             reply_markup=get_menu(),
         )
@@ -1103,9 +1338,8 @@ async def handle_ai_question(message: Message, state: FSMContext):
 
     msg = await message.answer("🤖 Fetching data & asking AI...")
 
-    # Gather fresh data
     page = session["page"]
-    att = await extract_attendance(page)
+    att  = await extract_attendance(page)
     fees = await extract_fees(page)
     exam = await extract_exam(page)
     context_data = {"attendance": att, "fees": fees, "exam": exam}
@@ -1121,13 +1355,11 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
     chat_id = callback.message.chat.id
     data = callback.data
 
-    # Show menu without session check
     if data == "show_menu":
         await callback.message.answer("📱 Main Menu:", reply_markup=get_menu())
         await callback.answer()
         return
 
-    # Session check (with auto-login)
     session = user_sessions.get(chat_id)
     if not session or is_expired(session):
         await callback.answer("⏳ Restoring session...", show_alert=False)
@@ -1156,28 +1388,45 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer(f"Loading {page_name}...")
         loading = await callback.message.answer(f"⏳ Loading {page_name}...")
 
-        # ── Attendance ────────────────────────────────────────────
-        if page_name == "📋 Attendance":
-            att = await extract_attendance(page)   # navigates internally
+        # ── Profile ───────────────────────────────────────────
+        if page_name == "👤 Profile":
+            profile_data = await extract_profile(page)
+            save_snapshot(chat_id, "profile", profile_data)
+            session.setdefault("cache", {})["profile"] = profile_data
+
+            screenshot = await browser_manager.save_screenshot(page, "profile")
+            await loading.delete()
+
+            await callback.message.answer_photo(
+                FSInputFile(screenshot),
+                caption="📸 Profile Page"
+            )
+            await callback.message.answer(
+                format_profile_message(profile_data),
+                parse_mode="Markdown",
+                reply_markup=get_back_menu()
+            )
+
+        # ── Attendance ────────────────────────────────────────
+        elif page_name == "📋 Attendance":
+            att = await extract_attendance(page)
             save_snapshot(chat_id, "attendance", att)
             session["cache"]["att"] = att
 
             screenshot = await browser_manager.save_screenshot(page, "attendance")
             await loading.delete()
 
-            # 1) Screenshot first so user can see the full page
             await callback.message.answer_photo(
                 FSInputFile(screenshot),
                 caption="📸 Attendance Page"
             )
-            # 2) Parsed summary right after
             await callback.message.answer(
                 format_attendance_message(att),
                 parse_mode="Markdown",
                 reply_markup=get_attendance_menu()
             )
 
-        # ── Fees ──────────────────────────────────────────────────
+        # ── Fees ──────────────────────────────────────────────
         elif page_name == "💰 Fees":
             fees = await extract_fees(page)
             save_snapshot(chat_id, "fees", fees)
@@ -1196,7 +1445,7 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
                 reply_markup=get_fees_menu()
             )
 
-        # ── Exam ──────────────────────────────────────────────────
+        # ── Exam ──────────────────────────────────────────────
         elif page_name == "📝 Exam":
             exam = await extract_exam(page)
             save_snapshot(chat_id, "exam", exam)
@@ -1215,7 +1464,7 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
                 reply_markup=get_back_menu()
             )
 
-        # ── All other pages → screenshot only ────────────────────
+        # ── All other pages → screenshot only ────────────────
         else:
             await page.goto(page_url, wait_until="networkidle")
             screenshot = await browser_manager.save_screenshot(page, "page")
@@ -1235,23 +1484,29 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Extracting data...")
         loading = await callback.message.answer(
             "⏳ Extracting ERP data…\n"
-            "_(Attendance may take a few seconds to render)_",
+            "_(Attendance, Fees, Exam & Profile)_",
             parse_mode="Markdown"
         )
-        att  = await extract_attendance(page)
-        fees = await extract_fees(page)
-        exam = await extract_exam(page)
+        att     = await extract_attendance(page)
+        fees    = await extract_fees(page)
+        exam    = await extract_exam(page)
+        profile = await extract_profile(page)
 
         save_snapshot(chat_id, "attendance", att)
         save_snapshot(chat_id, "fees", fees)
         save_snapshot(chat_id, "exam", exam)
+        save_snapshot(chat_id, "profile", profile)
 
-        # Cache for daily/detail sub-views
-        session["cache"]["att"]  = att
-        session["cache"]["fees"] = fees
-        session["cache"]["exam"] = exam
+        session.setdefault("cache", {}).update({
+            "att": att, "fees": fees, "exam": exam, "profile": profile
+        })
 
         await loading.delete()
+        await callback.message.answer(
+            format_profile_message(profile),
+            parse_mode="Markdown",
+            reply_markup=get_back_menu()
+        )
         await callback.message.answer(
             format_attendance_message(att),
             parse_mode="Markdown",
@@ -1268,8 +1523,21 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
             reply_markup=get_back_menu()
         )
 
+    elif data == "view_result":
+        await callback.answer("Fetching results...")
+        loading = await callback.message.answer("⏳ Loading your exam results...")
+        result_data = await extract_result(page)
+        save_snapshot(chat_id, "result", result_data)
+        session.setdefault("cache", {})["result"] = result_data
+        await loading.delete()
+        text = format_result_message(result_data)
+        if len(text) > 4000:
+            for i in range(0, len(text), 4000):
+                await callback.message.answer(text[i:i+4000], parse_mode="Markdown")
+        else:
+            await callback.message.answer(text, parse_mode="Markdown", reply_markup=get_back_menu())
+
     elif data == "att_daily":
-        # Show day-by-day breakdown from cache (or re-fetch)
         await callback.answer("Loading daily log...")
         att = session.get("cache", {}).get("att")
         if not att:
@@ -1279,7 +1547,6 @@ async def menu_handler(callback: CallbackQuery, state: FSMContext):
             await loading.delete()
         daily_text = format_attendance_daily(att)
         if len(daily_text) > 4000:
-            # Split into chunks if too long
             for i in range(0, len(daily_text), 4000):
                 await callback.message.answer(daily_text[i:i+4000], parse_mode="Markdown")
         else:
@@ -1353,10 +1620,11 @@ async def on_startup():
     asyncio.create_task(start_health())
     asyncio.create_task(run_scheduled_alerts())
 
-    # Register bot commands
     await bot.set_my_commands([
         BotCommand(command="start",      description="Start / Auto-login"),
         BotCommand(command="menu",       description="Show main menu"),
+        BotCommand(command="profile",    description="View my profile"),
+        BotCommand(command="result",     description="View exam results & SGPA"),
         BotCommand(command="attendance", description="Check attendance"),
         BotCommand(command="fees",       description="Check fee status"),
         BotCommand(command="exam",       description="Check exam results"),
@@ -1376,10 +1644,6 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # ── Conflict-safe startup ────────────────────────────────────
-    # On Render/Railway the old instance may still be alive for a
-    # few seconds after deploy. Drop the webhook + stale updates,
-    # then back off if another instance is still polling.
     logger.info("Clearing webhook and pending updates...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
